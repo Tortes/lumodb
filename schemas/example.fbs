@@ -1,4 +1,4 @@
-namespace tdldb.example;
+namespace LumoDB.example;
 
 table MapA {
   key:int;
@@ -17,4 +17,4 @@ table StructB {
 }
 
 root_type StructB;
-file_identifier "TDLB";
+file_identifier "LUMO";

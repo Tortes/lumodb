@@ -1,9 +1,14 @@
 build/
 cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
 
 DESIGN.md
 
-*.tdlv
-*.tdli
+*.lumov
+*.lumoi
+*.lumorv
+*.lumori
 
 .DS_Store

@@ -1,4 +1,4 @@
-#include "File.h"
+#include "lumodb/file.h"
 
 #include <cerrno>
 #include <cstring>
@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace tdldb::detail {
+namespace LumoDB::detail {
 namespace {
 
 std::string ErrnoMessage(std::string_view operation) {
@@ -188,4 +188,4 @@ Status WriteAllAt(int fd, const void* data, size_t size, uint64_t offset) {
   return Status::Ok();
 }
 
-}  // namespace tdldb::detail
+}  // namespace LumoDB::detail

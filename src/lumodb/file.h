@@ -4,9 +4,9 @@
 #include <cstdint>
 #include <filesystem>
 
-#include "tdldb/Status.h"
+#include "lumodb/status.h"
 
-namespace tdldb::detail {
+namespace LumoDB::detail {
 
 class FileDescriptor {
  public:
@@ -62,4 +62,4 @@ Status SyncFile(int fd);
 Status ReadAllAt(int fd, void* data, size_t size, uint64_t offset);
 Status WriteAllAt(int fd, const void* data, size_t size, uint64_t offset);
 
-}  // namespace tdldb::detail
+}  // namespace LumoDB::detail

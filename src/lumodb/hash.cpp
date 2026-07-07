@@ -1,10 +1,10 @@
-#include "Hash.h"
+#include "lumodb/hash.h"
 
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 
-namespace tdldb::detail {
+namespace LumoDB::detail {
 
 uint64_t HashString(std::string_view value) {
   constexpr uint64_t kOffsetBasis = 14695981039346656037ULL;
@@ -28,4 +28,4 @@ uint64_t MixHashes(uint64_t columnHash, uint64_t keyHash) {
   return value;
 }
 
-}  // namespace tdldb::detail
+}  // namespace LumoDB::detail

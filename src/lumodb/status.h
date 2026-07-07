@@ -3,7 +3,7 @@
 #include <string>
 #include <utility>
 
-namespace tdldb {
+namespace LumoDB {
 
 enum class StatusCode {
   kOk = 0,
@@ -48,4 +48,4 @@ class Status {
   std::string message_;
 };
 
-}  // namespace tdldb
+}  // namespace LumoDB

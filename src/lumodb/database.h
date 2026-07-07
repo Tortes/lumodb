@@ -8,13 +8,20 @@
 #include <string_view>
 #include <vector>
 
-#include "tdldb/Status.h"
+#include "lumodb/status.h"
 
-namespace tdldb {
+namespace LumoDB {
 
 struct DatabaseOptions {
   uint64_t initialBucketCount = 1ULL << 16;
+  uint64_t initialRowBucketCount = 1ULL << 16;
+  uint32_t rowShardCount = 8;
   double maxLoadFactor = 0.70;
+};
+
+struct RowStructEntry {
+  std::string_view key;
+  std::span<const std::byte> flatBufferBytes;
 };
 
 class Database {
@@ -40,16 +47,22 @@ class Database {
                    std::span<const std::byte> flatBufferBytes);
   Status GetStruct(std::string_view column, std::string_view key,
                    std::vector<std::byte>& flatBufferBytes) const;
+  Status PutRowStructs(std::string_view column, uint64_t rowId,
+                       std::span<const RowStructEntry> entries);
+  Status GetRowStruct(std::string_view column, uint64_t rowId, std::string_view key,
+                      std::vector<std::byte>& flatBufferBytes) const;
   Status GetMany(std::string_view column, const std::vector<std::string>& keys,
                  std::vector<std::vector<std::byte>>& values) const;
 
   [[nodiscard]] bool IsOpen() const;
   [[nodiscard]] uint64_t EntryCount() const;
   [[nodiscard]] uint64_t BucketCount() const;
+  [[nodiscard]] uint64_t RowCount() const;
+  [[nodiscard]] uint64_t RowBucketCount() const;
 
  private:
   class Impl;
   Impl* impl_;
 };
 
-}  // namespace tdldb
+}  // namespace LumoDB
