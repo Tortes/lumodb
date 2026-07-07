@@ -49,6 +49,29 @@ if(LUMODB_BUILD_TESTS)
   endif()
 
   include(GoogleTest)
+
+  function(lumodb_configure_gtest target_name)
+    target_link_libraries(${target_name} PRIVATE LumoDB GTest::gtest_main)
+    target_compile_features(${target_name} PRIVATE cxx_std_20)
+    foreach(GTEST_TARGET GTest::gtest_main GTest::gtest)
+      foreach(GTEST_LOCATION_PROPERTY
+          IMPORTED_LOCATION
+          IMPORTED_LOCATION_RELEASE
+          IMPORTED_LOCATION_RELWITHDEBINFO
+          IMPORTED_LOCATION_MINSIZEREL
+          IMPORTED_LOCATION_DEBUG)
+        get_target_property(GTEST_LOCATION ${GTEST_TARGET} ${GTEST_LOCATION_PROPERTY})
+        if(GTEST_LOCATION)
+          get_filename_component(GTEST_LIBRARY_DIR "${GTEST_LOCATION}" DIRECTORY)
+          set_property(TARGET ${target_name} APPEND PROPERTY BUILD_RPATH
+            "${GTEST_LIBRARY_DIR}"
+          )
+        endif()
+      endforeach()
+    endforeach()
+    gtest_discover_tests(${target_name} DISCOVERY_MODE PRE_TEST)
+  endfunction()
+
   add_executable(lumodb_tests
     tests/kv_test.cpp
     tests/parallel_row_test.cpp
@@ -56,25 +79,12 @@ if(LUMODB_BUILD_TESTS)
     tests/row_storage_test.cpp
     tests/struct_test.cpp
   )
-  target_link_libraries(lumodb_tests PRIVATE LumoDB GTest::gtest_main)
-  target_compile_features(lumodb_tests PRIVATE cxx_std_20)
-  foreach(GTEST_TARGET GTest::gtest_main GTest::gtest)
-    foreach(GTEST_LOCATION_PROPERTY
-        IMPORTED_LOCATION
-        IMPORTED_LOCATION_RELEASE
-        IMPORTED_LOCATION_RELWITHDEBINFO
-        IMPORTED_LOCATION_MINSIZEREL
-        IMPORTED_LOCATION_DEBUG)
-      get_target_property(GTEST_LOCATION ${GTEST_TARGET} ${GTEST_LOCATION_PROPERTY})
-      if(GTEST_LOCATION)
-        get_filename_component(GTEST_LIBRARY_DIR "${GTEST_LOCATION}" DIRECTORY)
-        set_property(TARGET lumodb_tests APPEND PROPERTY BUILD_RPATH
-          "${GTEST_LIBRARY_DIR}"
-        )
-      endif()
-    endforeach()
-  endforeach()
-  gtest_discover_tests(lumodb_tests DISCOVERY_MODE PRE_TEST)
+  lumodb_configure_gtest(lumodb_tests)
+
+  add_executable(lumodb_system_tests
+    tests/system_test.cpp
+  )
+  lumodb_configure_gtest(lumodb_system_tests)
 endif()
 
 if(LUMODB_BUILD_BENCHMARKS)

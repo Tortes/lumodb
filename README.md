@@ -178,9 +178,19 @@ back to FetchContent when needed.
 ctest --test-dir build --output-on-failure
 ```
 
-Current unit coverage includes KV put/get, struct byte payloads, row block
-lookup, object index rebuild, row index rebuild, and concurrent independent row
-writes under the same column.
+The default test suite includes focused unit tests plus system tests:
+
+- `lumodb_tests`: KV put/get, struct byte payloads, row block lookup, object
+  index rebuild, row index rebuild, and concurrent independent row writes under
+  the same column.
+- `lumodb_system_tests`: end-to-end object write/read, row write/read,
+  reopen/readback, same-column parallel row writes, and parallel row reads.
+
+Run only the system tests when validating the advertised read/write behavior:
+
+```bash
+ctest --test-dir build -R LumoDBSystemTest --output-on-failure
+```
 
 ## Benchmark
 
@@ -235,5 +245,6 @@ reads:
     ├── rebuild_test.cpp
     ├── row_storage_test.cpp
     ├── struct_test.cpp
+    ├── system_test.cpp
     └── test_utils.h
 ```
