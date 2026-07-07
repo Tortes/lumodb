@@ -16,12 +16,15 @@ inline constexpr std::array<char, 8> kIndexFileMagic = {'L', 'U', 'M', 'I',
 inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R',
                                                            'V', '0', '0', '1'};
 inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R',
-                                                           'I', '0', '0', '1'};
+                                                           'I', '0', '0', '2'};
 inline constexpr uint32_t kStorageVersion = 1;
 inline constexpr uint32_t kRecordMagic = 0x43455256;  // "VREC" little endian.
 inline constexpr uint32_t kRowBlockMagic = 0x424C4F52;  // "ROLB" little endian.
 inline constexpr uint8_t kBucketEmpty = 0;
 inline constexpr uint8_t kBucketFilled = 1;
+inline constexpr uint32_t kRowBucketEmpty = 0;
+inline constexpr uint32_t kRowBucketFilled = 1;
+inline constexpr uint32_t kRowBucketWriting = 2;
 
 struct ValueFileHeader {
   std::array<char, 8> magic = kValueFileMagic;
@@ -84,16 +87,15 @@ struct RowIndexFileHeader {
 };
 
 struct RowIndexBucket {
-  uint8_t state = kBucketEmpty;
-  std::array<uint8_t, 7> reserved = {};
+  uint32_t state = kRowBucketEmpty;
+  uint32_t shardId = 0;
   uint64_t columnHash = 0;
   uint64_t rowId = 0;
-  uint32_t shardId = 0;
-  uint32_t reserved32 = 0;
   uint64_t blockOffset = 0;
   uint64_t blockSize = 0;
   uint64_t sequence = 0;
   uint64_t reserved64 = 0;
+  uint64_t reserved65 = 0;
 };
 
 struct RowBlockHeader {

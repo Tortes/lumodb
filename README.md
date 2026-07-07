@@ -22,7 +22,7 @@ Column + RowId + Key  -> row index       -> row block local key index
 - `Column + Key` addressing for independent object categories.
 - `Column + RowId + Key` addressing for row-partitioned object maps.
 - Row blocks with local key indexes for efficient row-level grouping.
-- Parallel row writes through fixed value shards.
+- Mutex-free row write hot path for distinct row ids in a preallocated row index.
 - Index rebuild by scanning append-only value files.
 
 LumoDB intentionally does not implement SQL, range scans, deletion,
@@ -90,6 +90,12 @@ PutRowStructs(column, rowId, entries)
   -> row_index.lumori maps column/rowId to shard/offset/size
 ```
 
+Concurrent `PutRowStructs` calls for the same column and different `rowId`
+values reserve append offsets with atomics, write disjoint file ranges with
+`pwrite`, and publish row index buckets with atomic compare/exchange. Size
+`initialRowBucketCount` for the expected number of rows; live row writes return
+`InvalidArgument` instead of resizing the mmap row index on the write path.
+
 Reads are direct point reads. The caller is expected to know `column`, `rowId`,
 and `key`; LumoDB does not scan rows to discover objects.
 
@@ -134,6 +140,7 @@ db.GetStruct("StructA", "object-key", loaded);
 
 ```cpp
 LumoDB::DatabaseOptions options;
+options.initialRowBucketCount = 1ULL << 20;
 options.rowShardCount = 8;
 
 LumoDB::Database db;
@@ -173,7 +180,7 @@ ctest --test-dir build --output-on-failure
 
 Current unit coverage includes KV put/get, struct byte payloads, row block
 lookup, object index rebuild, row index rebuild, and concurrent independent row
-writes.
+writes under the same column.
 
 ## Benchmark
 

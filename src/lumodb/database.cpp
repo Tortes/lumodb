@@ -2,13 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "lumodb/file.h"
@@ -81,6 +82,7 @@ class Database::Impl {
 
     directory_ = directory;
     options_ = options;
+    rowPendingInsertCount_.store(0, std::memory_order_relaxed);
     options_.initialBucketCount = RoundUpPowerOfTwo(options_.initialBucketCount);
     options_.initialRowBucketCount = RoundUpPowerOfTwo(options_.initialRowBucketCount);
     if (options_.rowShardCount == 0) {
@@ -139,17 +141,14 @@ class Database::Impl {
       return Status::Ok();
     }
     Status status = Status::Ok();
-    {
-      std::lock_guard<std::mutex> lock(rowIndexMutex_);
-      status = rowIndexMap_.Sync();
+    status = rowIndexMap_.Sync();
+    if (!status) {
+      return status;
+    }
+    if (rowIndexFile_.IsValid()) {
+      status = detail::SyncFile(rowIndexFile_.Get());
       if (!status) {
         return status;
-      }
-      if (rowIndexFile_.IsValid()) {
-        status = detail::SyncFile(rowIndexFile_.Get());
-        if (!status) {
-          return status;
-        }
       }
     }
 
@@ -305,56 +304,47 @@ class Database::Impl {
     }
 
     const uint64_t columnHash = detail::HashString(column);
-    uint64_t sequence = 0;
-    {
-      std::lock_guard<std::mutex> lock(rowIndexMutex_);
-      sequence = RowIndexHeader()->nextSequence++;
+    Status status = ReserveRowIndexInsertSlot();
+    if (!status) {
+      return status;
     }
 
+    const uint64_t sequence = NextRowSequence();
     std::vector<std::byte> block;
-    Status status = BuildRowBlock(column, rowId, entries, sequence, columnHash, block);
+    status = BuildRowBlock(column, rowId, entries, sequence, columnHash, block);
     if (!status) {
+      ReleaseRowIndexInsertSlot();
       return status;
     }
 
     const uint32_t shardId = ShardForRow(columnHash, rowId);
-    uint64_t blockOffset = 0;
-    {
-      std::lock_guard<std::mutex> lock(*rowShardMutexes_[shardId]);
-      blockOffset = rowAppendOffsets_[shardId];
-      status = detail::WriteAllAt(rowValueFiles_[shardId].Get(), block.data(),
-                                  block.size(), blockOffset);
-      if (!status) {
-        return status;
-      }
-      rowAppendOffsets_[shardId] += block.size();
-    }
-
-    std::lock_guard<std::mutex> lock(rowIndexMutex_);
-    status = EnsureRowCapacityForInsert();
+    const uint64_t blockOffset = rowAppendOffsets_[shardId]->fetch_add(
+        static_cast<uint64_t>(block.size()), std::memory_order_relaxed);
+    status = detail::WriteAllAt(rowValueFiles_[shardId].Get(), block.data(),
+                                block.size(), blockOffset);
     if (!status) {
+      ReleaseRowIndexInsertSlot();
       return status;
     }
 
-    RowBucketLookup lookup;
-    status = FindRowBucket(column, rowId, columnHash, lookup);
-    if (!status) {
-      return status;
-    }
-
-    detail::RowIndexBucket bucket;
-    bucket.state = detail::kBucketFilled;
+    RowBucketData bucket;
     bucket.columnHash = columnHash;
     bucket.rowId = rowId;
     bucket.shardId = shardId;
     bucket.blockOffset = blockOffset;
-    bucket.blockSize = block.size();
+    bucket.blockSize = static_cast<uint64_t>(block.size());
     bucket.sequence = sequence;
 
-    RowBuckets()[lookup.index] = bucket;
-    if (!lookup.found) {
-      ++RowIndexHeader()->itemCount;
+    bool inserted = false;
+    status = InsertOrUpdateRowBucket(column, bucket, inserted);
+    if (!status) {
+      ReleaseRowIndexInsertSlot();
+      return status;
     }
+    if (inserted) {
+      IncrementRowItemCount();
+    }
+    ReleaseRowIndexInsertSlot();
     return Status::Ok();
   }
 
@@ -365,23 +355,23 @@ class Database::Impl {
     }
 
     const uint64_t columnHash = detail::HashString(column);
-    detail::RowIndexBucket bucket;
-    {
-      std::lock_guard<std::mutex> lock(rowIndexMutex_);
-      RowBucketLookup lookup;
-      Status status = FindRowBucket(column, rowId, columnHash, lookup);
-      if (!status) {
-        return status;
-      }
-      if (!lookup.found) {
-        return Status::NotFound("row not found");
-      }
-      bucket = RowBuckets()[lookup.index];
+    RowBucketLookup lookup;
+    Status status = FindRowBucket(column, rowId, columnHash, lookup);
+    if (!status) {
+      return status;
+    }
+    if (!lookup.found) {
+      return Status::NotFound("row not found");
     }
 
+    detail::RowIndexBucket bucket;
+    status = LoadFilledRowBucketSnapshot(lookup.index, bucket);
+    if (!status) {
+      return status;
+    }
     std::vector<std::byte> block(static_cast<size_t>(bucket.blockSize));
-    Status status = detail::ReadAllAt(rowValueFiles_[bucket.shardId].Get(), block.data(),
-                                      block.size(), bucket.blockOffset);
+    status = detail::ReadAllAt(rowValueFiles_[bucket.shardId].Get(), block.data(),
+                               block.size(), bucket.blockOffset);
     if (!status) {
       return status;
     }
@@ -429,15 +419,13 @@ class Database::Impl {
     if (!rowIndexMap_.IsMapped()) {
       return 0;
     }
-    std::lock_guard<std::mutex> lock(rowIndexMutex_);
-    return RowIndexHeader()->itemCount;
+    return LoadRowItemCount();
   }
 
   [[nodiscard]] uint64_t RowBucketCount() const {
     if (!rowIndexMap_.IsMapped()) {
       return 0;
     }
-    std::lock_guard<std::mutex> lock(rowIndexMutex_);
     return RowIndexHeader()->bucketCount;
   }
 
@@ -450,6 +438,21 @@ class Database::Impl {
   struct RowBucketLookup {
     uint64_t index = 0;
     bool found = false;
+  };
+
+  struct RowBucketData {
+    uint64_t columnHash = 0;
+    uint64_t rowId = 0;
+    uint32_t shardId = 0;
+    uint64_t blockOffset = 0;
+    uint64_t blockSize = 0;
+    uint64_t sequence = 0;
+  };
+
+  enum class RowBucketSnapshotState {
+    kEmpty,
+    kFilled,
+    kWriting,
   };
 
   detail::IndexFileHeader* IndexHeader() {
@@ -495,8 +498,8 @@ class Database::Impl {
     rowIndexMap_.Unmap();
     rowIndexFile_.Reset();
     rowValueFiles_.clear();
-    rowShardMutexes_.clear();
     rowAppendOffsets_.clear();
+    rowPendingInsertCount_.store(0, std::memory_order_relaxed);
     indexMap_.Unmap();
     indexFile_.Reset();
     valueFile_.Reset();
@@ -582,13 +585,11 @@ class Database::Impl {
 
   Status OpenRowValueFiles() {
     rowValueFiles_.clear();
-    rowShardMutexes_.clear();
     rowAppendOffsets_.clear();
     rowValueFiles_.resize(options_.rowShardCount);
-    rowShardMutexes_.reserve(options_.rowShardCount);
-    rowAppendOffsets_.resize(options_.rowShardCount);
+    rowAppendOffsets_.reserve(options_.rowShardCount);
     for (uint32_t shardId = 0; shardId < options_.rowShardCount; ++shardId) {
-      rowShardMutexes_.push_back(std::make_unique<std::mutex>());
+      rowAppendOffsets_.push_back(std::make_unique<std::atomic<uint64_t>>(0));
     }
 
     for (uint32_t shardId = 0; shardId < options_.rowShardCount; ++shardId) {
@@ -612,7 +613,7 @@ class Database::Impl {
         if (!status) {
           return status;
         }
-        rowAppendOffsets_[shardId] = sizeof(header);
+        rowAppendOffsets_[shardId]->store(sizeof(header), std::memory_order_relaxed);
         continue;
       }
 
@@ -631,7 +632,7 @@ class Database::Impl {
           header.headerSize != sizeof(detail::RowValueFileHeader)) {
         return Status::Corruption("row value file header is invalid");
       }
-      rowAppendOffsets_[shardId] = fileSize;
+      rowAppendOffsets_[shardId]->store(fileSize, std::memory_order_relaxed);
     }
 
     return Status::Ok();
@@ -689,7 +690,22 @@ class Database::Impl {
     const uint64_t expectedSize =
         sizeof(detail::RowIndexFileHeader) +
         header->bucketCount * sizeof(detail::RowIndexBucket);
-    return expectedSize == fileSize && header->itemCount <= header->bucketCount;
+    if (expectedSize != fileSize || header->itemCount > header->bucketCount) {
+      return false;
+    }
+
+    uint64_t filledCount = 0;
+    for (uint64_t index = 0; index < header->bucketCount; ++index) {
+      const uint32_t state = RowBuckets()[index].state;
+      if (state == detail::kRowBucketFilled) {
+        ++filledCount;
+        continue;
+      }
+      if (state != detail::kRowBucketEmpty) {
+        return false;
+      }
+    }
+    return filledCount == header->itemCount;
   }
 
   Status CreateEmptyRowIndex(uint64_t bucketCount) {
@@ -757,7 +773,7 @@ class Database::Impl {
         }
 
         detail::RowIndexBucket bucket;
-        bucket.state = detail::kBucketFilled;
+        bucket.state = detail::kRowBucketFilled;
         bucket.columnHash = blockHeader.columnHash;
         bucket.rowId = blockHeader.rowId;
         bucket.shardId = shardId;
@@ -772,7 +788,7 @@ class Database::Impl {
         nextSequence = std::max(nextSequence, blockHeader.sequence + 1);
         offset += blockHeader.blockSize;
       }
-      rowAppendOffsets_[shardId] = fileSize;
+      rowAppendOffsets_[shardId]->store(fileSize, std::memory_order_relaxed);
     }
 
     RowIndexHeader()->nextSequence = nextSequence;
@@ -1165,7 +1181,7 @@ class Database::Impl {
     oldBuckets.reserve(static_cast<size_t>(RowIndexHeader()->itemCount));
     for (uint64_t index = 0; index < RowIndexHeader()->bucketCount; ++index) {
       const detail::RowIndexBucket& bucket = RowBuckets()[index];
-      if (bucket.state == detail::kBucketFilled) {
+      if (bucket.state == detail::kRowBucketFilled) {
         oldBuckets.push_back(bucket);
       }
     }
@@ -1194,12 +1210,195 @@ class Database::Impl {
 
     for (uint64_t probe = 0; probe < bucketCount; ++probe) {
       const uint64_t index = (start + probe) & mask;
-      if (RowBuckets()[index].state == detail::kBucketEmpty) {
+      if (RowBuckets()[index].state == detail::kRowBucketEmpty) {
         RowBuckets()[index] = bucket;
         return Status::Ok();
       }
     }
     return Status::Corruption("row index table is full during resize");
+  }
+
+  template <typename T>
+  T AtomicLoad(const T& value, std::memory_order order) const {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(order);
+  }
+
+  template <typename T>
+  void AtomicStore(T& target, T value, std::memory_order order) {
+    std::atomic_ref<T>(target).store(value, order);
+  }
+
+  uint64_t LoadRowItemCount(
+      std::memory_order order = std::memory_order_acquire) const {
+    return AtomicLoad(RowIndexHeader()->itemCount, order);
+  }
+
+  void IncrementRowItemCount() {
+    std::atomic_ref<uint64_t>(RowIndexHeader()->itemCount)
+        .fetch_add(1, std::memory_order_release);
+  }
+
+  uint64_t NextRowSequence() {
+    return std::atomic_ref<uint64_t>(RowIndexHeader()->nextSequence)
+        .fetch_add(1, std::memory_order_relaxed);
+  }
+
+  Status ReserveRowIndexInsertSlot() {
+    const uint64_t bucketCount = RowIndexHeader()->bucketCount;
+    for (;;) {
+      const uint64_t itemCount = LoadRowItemCount();
+      uint64_t pending = rowPendingInsertCount_.load(std::memory_order_relaxed);
+      const double loadAfterInsert =
+          static_cast<double>(itemCount + pending + 1) /
+          static_cast<double>(bucketCount);
+      if (loadAfterInsert > options_.maxLoadFactor) {
+        return Status::InvalidArgument(
+            "row index capacity exceeded; increase initialRowBucketCount");
+      }
+      if (rowPendingInsertCount_.compare_exchange_weak(
+              pending, pending + 1, std::memory_order_acq_rel,
+              std::memory_order_relaxed)) {
+        return Status::Ok();
+      }
+    }
+  }
+
+  void ReleaseRowIndexInsertSlot() {
+    rowPendingInsertCount_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  Status LoadRowBucketSnapshot(uint64_t index, detail::RowIndexBucket& snapshot,
+                               RowBucketSnapshotState& snapshotState) const {
+    const detail::RowIndexBucket& bucket = RowBuckets()[index];
+    const uint32_t state = AtomicLoad(bucket.state, std::memory_order_acquire);
+    if (state == detail::kRowBucketEmpty) {
+      snapshotState = RowBucketSnapshotState::kEmpty;
+      return Status::Ok();
+    }
+    if (state == detail::kRowBucketWriting) {
+      snapshotState = RowBucketSnapshotState::kWriting;
+      return Status::Ok();
+    }
+    if (state != detail::kRowBucketFilled) {
+      return Status::Corruption("row index bucket state is invalid");
+    }
+
+    snapshot.state = detail::kRowBucketFilled;
+    snapshot.shardId = AtomicLoad(bucket.shardId, std::memory_order_relaxed);
+    snapshot.columnHash = AtomicLoad(bucket.columnHash, std::memory_order_relaxed);
+    snapshot.rowId = AtomicLoad(bucket.rowId, std::memory_order_relaxed);
+    snapshot.blockOffset = AtomicLoad(bucket.blockOffset, std::memory_order_relaxed);
+    snapshot.blockSize = AtomicLoad(bucket.blockSize, std::memory_order_relaxed);
+    snapshot.sequence = AtomicLoad(bucket.sequence, std::memory_order_relaxed);
+
+    const uint32_t stateAfter = AtomicLoad(bucket.state, std::memory_order_acquire);
+    if (stateAfter != detail::kRowBucketFilled) {
+      snapshotState = RowBucketSnapshotState::kWriting;
+      return Status::Ok();
+    }
+
+    snapshotState = RowBucketSnapshotState::kFilled;
+    return Status::Ok();
+  }
+
+  Status LoadFilledRowBucketSnapshot(uint64_t index,
+                                     detail::RowIndexBucket& snapshot) const {
+    for (;;) {
+      RowBucketSnapshotState snapshotState = RowBucketSnapshotState::kEmpty;
+      Status status = LoadRowBucketSnapshot(index, snapshot, snapshotState);
+      if (!status) {
+        return status;
+      }
+      if (snapshotState == RowBucketSnapshotState::kFilled) {
+        return Status::Ok();
+      }
+      if (snapshotState == RowBucketSnapshotState::kEmpty) {
+        return Status::Corruption("row index bucket is empty");
+      }
+      std::this_thread::yield();
+    }
+  }
+
+  void StoreRowBucketData(detail::RowIndexBucket& bucket,
+                          const RowBucketData& data) {
+    AtomicStore(bucket.shardId, data.shardId, std::memory_order_relaxed);
+    AtomicStore(bucket.columnHash, data.columnHash, std::memory_order_relaxed);
+    AtomicStore(bucket.rowId, data.rowId, std::memory_order_relaxed);
+    AtomicStore(bucket.blockOffset, data.blockOffset, std::memory_order_relaxed);
+    AtomicStore(bucket.blockSize, data.blockSize, std::memory_order_relaxed);
+    AtomicStore(bucket.sequence, data.sequence, std::memory_order_relaxed);
+  }
+
+  Status InsertOrUpdateRowBucket(std::string_view column,
+                                 const RowBucketData& data, bool& inserted) {
+    const uint64_t bucketCount = RowIndexHeader()->bucketCount;
+    const uint64_t mask = bucketCount - 1;
+    const uint64_t start = detail::MixHashes(data.columnHash, data.rowId) & mask;
+
+    for (;;) {
+      bool retry = false;
+      for (uint64_t probe = 0; probe < bucketCount; ++probe) {
+        const uint64_t index = (start + probe) & mask;
+        detail::RowIndexBucket& target = RowBuckets()[index];
+
+        detail::RowIndexBucket snapshot;
+        RowBucketSnapshotState snapshotState = RowBucketSnapshotState::kEmpty;
+        Status status = LoadRowBucketSnapshot(index, snapshot, snapshotState);
+        if (!status) {
+          return status;
+        }
+
+        std::atomic_ref<uint32_t> stateRef(target.state);
+        if (snapshotState == RowBucketSnapshotState::kEmpty) {
+          uint32_t expected = detail::kRowBucketEmpty;
+          if (!stateRef.compare_exchange_strong(
+                  expected, detail::kRowBucketWriting, std::memory_order_acq_rel,
+                  std::memory_order_acquire)) {
+            retry = true;
+            break;
+          }
+          StoreRowBucketData(target, data);
+          stateRef.store(detail::kRowBucketFilled, std::memory_order_release);
+          inserted = true;
+          return Status::Ok();
+        }
+
+        if (snapshotState == RowBucketSnapshotState::kWriting) {
+          retry = true;
+          break;
+        }
+
+        if (snapshot.columnHash != data.columnHash || snapshot.rowId != data.rowId) {
+          continue;
+        }
+
+        bool matches = false;
+        status = RowBlockMatches(snapshot, column, data.rowId, matches);
+        if (!status) {
+          return status;
+        }
+        if (!matches) {
+          continue;
+        }
+
+        uint32_t expected = detail::kRowBucketFilled;
+        if (!stateRef.compare_exchange_strong(
+                expected, detail::kRowBucketWriting, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+          retry = true;
+          break;
+        }
+        StoreRowBucketData(target, data);
+        stateRef.store(detail::kRowBucketFilled, std::memory_order_release);
+        inserted = false;
+        return Status::Ok();
+      }
+
+      if (!retry) {
+        return Status::Corruption("row index table is full");
+      }
+      std::this_thread::yield();
+    }
   }
 
   Status FindRowBucket(std::string_view column, uint64_t rowId, uint64_t columnHash,
@@ -1208,31 +1407,46 @@ class Database::Impl {
     const uint64_t mask = bucketCount - 1;
     const uint64_t start = detail::MixHashes(columnHash, rowId) & mask;
 
-    for (uint64_t probe = 0; probe < bucketCount; ++probe) {
-      const uint64_t index = (start + probe) & mask;
-      const detail::RowIndexBucket& bucket = RowBuckets()[index];
-      if (bucket.state == detail::kBucketEmpty) {
-        lookup.index = index;
-        lookup.found = false;
-        return Status::Ok();
-      }
-      if (bucket.columnHash != columnHash || bucket.rowId != rowId) {
-        continue;
+    for (;;) {
+      bool retry = false;
+      for (uint64_t probe = 0; probe < bucketCount; ++probe) {
+        const uint64_t index = (start + probe) & mask;
+        detail::RowIndexBucket bucket;
+        RowBucketSnapshotState snapshotState = RowBucketSnapshotState::kEmpty;
+        Status status = LoadRowBucketSnapshot(index, bucket, snapshotState);
+        if (!status) {
+          return status;
+        }
+        if (snapshotState == RowBucketSnapshotState::kEmpty) {
+          lookup.index = index;
+          lookup.found = false;
+          return Status::Ok();
+        }
+        if (snapshotState == RowBucketSnapshotState::kWriting) {
+          retry = true;
+          break;
+        }
+        if (bucket.columnHash != columnHash || bucket.rowId != rowId) {
+          continue;
+        }
+
+        bool matches = false;
+        status = RowBlockMatches(bucket, column, rowId, matches);
+        if (!status) {
+          return status;
+        }
+        if (matches) {
+          lookup.index = index;
+          lookup.found = true;
+          return Status::Ok();
+        }
       }
 
-      bool matches = false;
-      Status status = RowBlockMatches(bucket, column, rowId, matches);
-      if (!status) {
-        return status;
+      if (!retry) {
+        return Status::Corruption("row index table is full");
       }
-      if (matches) {
-        lookup.index = index;
-        lookup.found = true;
-        return Status::Ok();
-      }
+      std::this_thread::yield();
     }
-
-    return Status::Corruption("row index table is full");
   }
 
   Status RowBlockMatches(const detail::RowIndexBucket& bucket, std::string_view column,
@@ -1345,9 +1559,8 @@ class Database::Impl {
   detail::MappedFile indexMap_;
   detail::MappedFile rowIndexMap_;
   std::vector<detail::FileDescriptor> rowValueFiles_;
-  std::vector<std::unique_ptr<std::mutex>> rowShardMutexes_;
-  std::vector<uint64_t> rowAppendOffsets_;
-  mutable std::mutex rowIndexMutex_;
+  std::vector<std::unique_ptr<std::atomic<uint64_t>>> rowAppendOffsets_;
+  std::atomic<uint64_t> rowPendingInsertCount_{0};
   uint64_t appendOffset_ = 0;
   bool open_ = false;
 };

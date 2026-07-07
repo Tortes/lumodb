@@ -7,11 +7,11 @@
 
 namespace {
 
-TEST(ParallelRowStorageTest, WritesIndependentRowsConcurrently) {
+TEST(ParallelRowStorageTest, WritesSameColumnDifferentRowsConcurrently) {
   const std::filesystem::path directory = LumoDB::test::MakeTestDirectory("row-parallel");
 
   LumoDB::DatabaseOptions options;
-  options.initialRowBucketCount = 16;
+  options.initialRowBucketCount = 128;
   options.rowShardCount = 4;
 
   LumoDB::Database database;
@@ -50,9 +50,13 @@ TEST(ParallelRowStorageTest, WritesIndependentRowsConcurrently) {
   EXPECT_FALSE(failed);
   EXPECT_EQ(database.RowCount(), 64);
 
-  std::vector<std::byte> value;
-  ASSERT_OK(database.GetRowStruct("StructA", 42, "second", value));
-  EXPECT_EQ(LumoDB::test::BytesToString(value), "second-42");
+  for (uint64_t rowId = 0; rowId < 64; ++rowId) {
+    std::vector<std::byte> value;
+    ASSERT_OK(database.GetRowStruct("StructA", rowId, "first", value));
+    EXPECT_EQ(LumoDB::test::BytesToString(value), "first-" + std::to_string(rowId));
+    ASSERT_OK(database.GetRowStruct("StructA", rowId, "second", value));
+    EXPECT_EQ(LumoDB::test::BytesToString(value), "second-" + std::to_string(rowId));
+  }
   ASSERT_OK(database.Close());
 }
 
