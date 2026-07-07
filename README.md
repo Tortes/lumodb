@@ -10,8 +10,6 @@ objects. It stores values as opaque bytes, so FlatBuffers, Protobuf, or custom
 binary payloads can be written and read back without coupling the database layer
 to a serializer.
 
-![LumoDB architecture](docs/assets/lumodb-architecture.png)
-
 ```text
 Column + Key          -> mmap hash index -> append-only value offset
 Column + RowId + Key  -> row index       -> row block local key index
@@ -29,6 +27,17 @@ Column + RowId + Key  -> row index       -> row block local key index
 
 LumoDB intentionally does not implement SQL, range scans, deletion,
 transactions, or compaction. It is focused on exact-key whole-object readback.
+
+## Storage Format
+
+![LumoDB storage format](docs/assets/lumodb-storage-format.png)
+
+The format is split into four structures:
+
+- `Value File`: append-only records for the simple object path.
+- `Object Index`: mmap hash buckets pointing into `values.lumov`.
+- `Row Index`: mmap hash buckets mapping `(column, rowId)` to a row block.
+- `Row Block`: one row-local key index plus packed key/value byte regions.
 
 ## Quick Start
 
@@ -200,7 +209,7 @@ reads:
 │   └── benchmark.cpp
 ├── docs/
 │   └── assets/
-│       └── lumodb-architecture.png
+│       └── lumodb-storage-format.png
 ├── schemas/
 │   └── example.fbs
 ├── src/
