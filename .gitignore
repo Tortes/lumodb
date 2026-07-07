@@ -1,0 +1,9 @@
+build/
+cmake-build-*/
+
+DESIGN.md
+
+*.tdlv
+*.tdli
+
+.DS_Store

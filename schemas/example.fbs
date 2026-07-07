@@ -1,0 +1,20 @@
+namespace tdldb.example;
+
+table MapA {
+  key:int;
+  value:string;
+}
+
+table StructA {
+  mapA:[MapA];
+  mapB:[MapA];
+  used:bool;
+}
+
+table StructB {
+  sA:[StructA];
+  sB:[StructA];
+}
+
+root_type StructB;
+file_identifier "TDLB";
