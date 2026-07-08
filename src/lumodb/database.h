@@ -47,6 +47,8 @@ class Database {
                    std::span<const std::byte> flatBufferBytes);
   Status GetStruct(std::string_view column, std::string_view key,
                    std::vector<std::byte>& flatBufferBytes) const;
+  Status PutRowStruct(std::string_view column, uint64_t rowId, std::string_view key,
+                      std::span<const std::byte> flatBufferBytes);
   Status PutRowStructs(std::string_view column, uint64_t rowId,
                        std::span<const RowStructEntry> entries);
   Status GetRowStruct(std::string_view column, uint64_t rowId, std::string_view key,

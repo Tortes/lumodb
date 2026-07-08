@@ -84,8 +84,13 @@ Row storage groups many keyed objects into one row block. Each row block has a
 local key index, then gets appended to one value shard:
 
 ```text
+PutRowStruct(column, rowId, key, bytes)
+  -> merge one key into the row map
+  -> append a replacement row block
+  -> row_index.lumori maps column/rowId to shard/offset/size
+
 PutRowStructs(column, rowId, entries)
-  -> build one row block with local key index
+  -> build one complete row block with local key index
   -> append to row_values-NNN.lumorv
   -> row_index.lumori maps column/rowId to shard/offset/size
 ```
@@ -147,6 +152,16 @@ LumoDB::Database db;
 db.Open("/tmp/lumodb", options);
 
 std::vector<std::byte> objectA = BuildStructA();
+db.PutRowStruct("StructA", 42, "object-a", objectA);
+
+std::vector<std::byte> loaded;
+db.GetRowStruct("StructA", 42, "object-a", loaded);
+```
+
+Batch row write:
+
+```cpp
+std::vector<std::byte> objectA = BuildStructA();
 std::vector<std::byte> objectB = BuildStructA();
 std::vector<LumoDB::RowStructEntry> entries = {
     {.key = "object-a", .flatBufferBytes = objectA},
@@ -154,9 +169,6 @@ std::vector<LumoDB::RowStructEntry> entries = {
 };
 
 db.PutRowStructs("StructA", 42, entries);
-
-std::vector<std::byte> loaded;
-db.GetRowStruct("StructA", 42, "object-a", loaded);
 ```
 
 ## FlatBuffers

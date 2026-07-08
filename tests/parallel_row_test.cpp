@@ -60,4 +60,51 @@ TEST(ParallelRowStorageTest, WritesSameColumnDifferentRowsConcurrently) {
   ASSERT_OK(database.Close());
 }
 
+TEST(ParallelRowStorageTest, WritesSameColumnDifferentRowsWithSingleKeyApi) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("row-parallel-single-key");
+
+  LumoDB::DatabaseOptions options;
+  options.initialRowBucketCount = 128;
+  options.rowShardCount = 4;
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  std::mutex failureMutex;
+  bool failed = false;
+  auto worker = [&](uint64_t beginRow, uint64_t endRow) {
+    for (uint64_t rowId = beginRow; rowId < endRow; ++rowId) {
+      const std::string expected = "value-" + std::to_string(rowId);
+      LumoDB::Status status = database.PutRowStruct(
+          "StructA", rowId, "payload", LumoDB::test::MakeBytes(expected));
+      if (!status) {
+        std::lock_guard<std::mutex> lock(failureMutex);
+        failed = true;
+        return;
+      }
+    }
+  };
+
+  std::thread t1(worker, 0, 16);
+  std::thread t2(worker, 16, 32);
+  std::thread t3(worker, 32, 48);
+  std::thread t4(worker, 48, 64);
+  t1.join();
+  t2.join();
+  t3.join();
+  t4.join();
+
+  EXPECT_FALSE(failed);
+  EXPECT_EQ(database.RowCount(), 64);
+
+  for (uint64_t rowId = 0; rowId < 64; ++rowId) {
+    std::vector<std::byte> value;
+    ASSERT_OK(database.GetRowStruct("StructA", rowId, "payload", value));
+    EXPECT_EQ(LumoDB::test::BytesToString(value),
+              "value-" + std::to_string(rowId));
+  }
+  ASSERT_OK(database.Close());
+}
+
 }  // namespace

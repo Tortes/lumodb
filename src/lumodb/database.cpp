@@ -291,8 +291,54 @@ class Database::Impl {
                              flatBufferBytes.size(), bucket.valueOffset);
   }
 
+  Status PutRowStruct(std::string_view column, uint64_t rowId, std::string_view key,
+                      std::span<const std::byte> flatBufferBytes) {
+    if (!open_) {
+      return Status::NotOpen("database is not open");
+    }
+    if (!FitsUint32(column.size()) || !FitsUint32(key.size())) {
+      return Status::InvalidArgument("column and key must fit in uint32 length");
+    }
+
+    const uint64_t columnHash = detail::HashString(column);
+    std::vector<std::string> keys;
+    std::vector<std::vector<std::byte>> values;
+    bool found = false;
+    Status status = LoadRowEntries(column, rowId, columnHash, found, keys, values);
+    if (!status) {
+      return status;
+    }
+
+    bool replaced = false;
+    for (size_t index = 0; index < keys.size(); ++index) {
+      if (keys[index] == key) {
+        values[index].assign(flatBufferBytes.begin(), flatBufferBytes.end());
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) {
+      keys.emplace_back(key);
+      values.emplace_back(flatBufferBytes.begin(), flatBufferBytes.end());
+    }
+
+    std::vector<RowStructEntry> entries;
+    entries.reserve(keys.size());
+    for (size_t index = 0; index < keys.size(); ++index) {
+      entries.push_back({.key = keys[index], .flatBufferBytes = values[index]});
+    }
+
+    return WriteRowStructs(column, rowId, entries, !found);
+  }
+
   Status PutRowStructs(std::string_view column, uint64_t rowId,
                        std::span<const RowStructEntry> entries) {
+    return WriteRowStructs(column, rowId, entries, true);
+  }
+
+  Status WriteRowStructs(std::string_view column, uint64_t rowId,
+                         std::span<const RowStructEntry> entries,
+                         bool reserveInsertSlot) {
     if (!open_) {
       return Status::NotOpen("database is not open");
     }
@@ -304,16 +350,23 @@ class Database::Impl {
     }
 
     const uint64_t columnHash = detail::HashString(column);
-    Status status = ReserveRowIndexInsertSlot();
-    if (!status) {
-      return status;
+    bool reserved = false;
+    Status status = Status::Ok();
+    if (reserveInsertSlot) {
+      status = ReserveRowIndexInsertSlot();
+      if (!status) {
+        return status;
+      }
+      reserved = true;
     }
 
     const uint64_t sequence = NextRowSequence();
     std::vector<std::byte> block;
     status = BuildRowBlock(column, rowId, entries, sequence, columnHash, block);
     if (!status) {
-      ReleaseRowIndexInsertSlot();
+      if (reserved) {
+        ReleaseRowIndexInsertSlot();
+      }
       return status;
     }
 
@@ -323,7 +376,9 @@ class Database::Impl {
     status = detail::WriteAllAt(rowValueFiles_[shardId].Get(), block.data(),
                                 block.size(), blockOffset);
     if (!status) {
-      ReleaseRowIndexInsertSlot();
+      if (reserved) {
+        ReleaseRowIndexInsertSlot();
+      }
       return status;
     }
 
@@ -338,13 +393,17 @@ class Database::Impl {
     bool inserted = false;
     status = InsertOrUpdateRowBucket(column, bucket, inserted);
     if (!status) {
-      ReleaseRowIndexInsertSlot();
+      if (reserved) {
+        ReleaseRowIndexInsertSlot();
+      }
       return status;
     }
     if (inserted) {
       IncrementRowItemCount();
     }
-    ReleaseRowIndexInsertSlot();
+    if (reserved) {
+      ReleaseRowIndexInsertSlot();
+    }
     return Status::Ok();
   }
 
@@ -369,9 +428,8 @@ class Database::Impl {
     if (!status) {
       return status;
     }
-    std::vector<std::byte> block(static_cast<size_t>(bucket.blockSize));
-    status = detail::ReadAllAt(rowValueFiles_[bucket.shardId].Get(), block.data(),
-                               block.size(), bucket.blockOffset);
+    std::vector<std::byte> block;
+    status = LoadRowBlock(bucket, block);
     if (!status) {
       return status;
     }
@@ -957,6 +1015,114 @@ class Database::Impl {
         static_cast<uint64_t>(blockHeader.bucketCount) * sizeof(detail::RowKeyBucket);
     return detail::ReadAllAt(rowValueFiles_[shardId].Get(), column.data(),
                              column.size(), columnOffset);
+  }
+
+  Status LoadRowBlock(const detail::RowIndexBucket& bucket,
+                      std::vector<std::byte>& block) const {
+    if (bucket.shardId >= rowValueFiles_.size()) {
+      return Status::Corruption("row index points to an invalid shard");
+    }
+    block.resize(static_cast<size_t>(bucket.blockSize));
+    return detail::ReadAllAt(rowValueFiles_[bucket.shardId].Get(), block.data(),
+                             block.size(), bucket.blockOffset);
+  }
+
+  Status DecodeRowBlockEntries(const std::vector<std::byte>& block,
+                               std::string_view column, uint64_t rowId,
+                               std::vector<std::string>& keys,
+                               std::vector<std::vector<std::byte>>& values) const {
+    if (block.size() < sizeof(detail::RowBlockHeader)) {
+      return Status::Corruption("row block is truncated");
+    }
+
+    const auto* header =
+        reinterpret_cast<const detail::RowBlockHeader*>(block.data());
+    if (!IsValidRowBlockHeader(*header) || header->blockSize != block.size() ||
+        header->rowId != rowId || header->columnHash != detail::HashString(column)) {
+      return Status::Corruption("row block header does not match requested row");
+    }
+
+    const uint64_t bucketsOffset = sizeof(detail::RowBlockHeader);
+    const uint64_t columnOffset =
+        bucketsOffset + static_cast<uint64_t>(header->bucketCount) *
+                            sizeof(detail::RowKeyBucket);
+    const uint64_t keyBytesOffset = columnOffset + header->columnSize;
+    const uint64_t valueBytesOffset = keyBytesOffset + header->keyBytesSize;
+
+    const auto* storedColumn =
+        reinterpret_cast<const char*>(block.data() + columnOffset);
+    if (std::string_view(storedColumn, header->columnSize) != column) {
+      return Status::Corruption("row block column does not match requested column");
+    }
+
+    const auto* keyBuckets =
+        reinterpret_cast<const detail::RowKeyBucket*>(block.data() + bucketsOffset);
+    keys.clear();
+    values.clear();
+    keys.reserve(header->itemCount);
+    values.reserve(header->itemCount);
+
+    for (uint64_t index = 0; index < header->bucketCount; ++index) {
+      const detail::RowKeyBucket& bucket = keyBuckets[index];
+      if (bucket.state == detail::kBucketEmpty) {
+        continue;
+      }
+      if (bucket.state != detail::kBucketFilled) {
+        return Status::Corruption("row key bucket state is invalid");
+      }
+      if (bucket.keyOffset + bucket.keySize > header->keyBytesSize ||
+          bucket.valueOffset + bucket.valueSize > header->valueBytesSize) {
+        return Status::Corruption("row key bucket points outside block");
+      }
+
+      const auto* storedKey = reinterpret_cast<const char*>(
+          block.data() + keyBytesOffset + bucket.keyOffset);
+      const std::byte* valueBegin =
+          block.data() + valueBytesOffset + bucket.valueOffset;
+      keys.emplace_back(storedKey, static_cast<size_t>(bucket.keySize));
+      values.emplace_back(valueBegin, valueBegin + bucket.valueSize);
+    }
+
+    if (keys.size() != header->itemCount) {
+      return Status::Corruption("row block item count does not match key buckets");
+    }
+    return Status::Ok();
+  }
+
+  Status LoadRowEntries(std::string_view column, uint64_t rowId, uint64_t columnHash,
+                        bool& found, std::vector<std::string>& keys,
+                        std::vector<std::vector<std::byte>>& values) const {
+    found = false;
+    keys.clear();
+    values.clear();
+
+    RowBucketLookup lookup;
+    Status status = FindRowBucket(column, rowId, columnHash, lookup);
+    if (!status) {
+      return status;
+    }
+    if (!lookup.found) {
+      return Status::Ok();
+    }
+
+    detail::RowIndexBucket bucket;
+    status = LoadFilledRowBucketSnapshot(lookup.index, bucket);
+    if (!status) {
+      return status;
+    }
+
+    std::vector<std::byte> block;
+    status = LoadRowBlock(bucket, block);
+    if (!status) {
+      return status;
+    }
+    status = DecodeRowBlockEntries(block, column, rowId, keys, values);
+    if (!status) {
+      return status;
+    }
+
+    found = true;
+    return Status::Ok();
   }
 
   Status BuildRowBlock(std::string_view column, uint64_t rowId,
@@ -1615,6 +1781,13 @@ Status Database::GetStruct(std::string_view column, std::string_view key,
                            std::vector<std::byte>& flatBufferBytes) const {
   return impl_ == nullptr ? Status::NotOpen("database is not open")
                           : impl_->GetStruct(column, key, flatBufferBytes);
+}
+
+Status Database::PutRowStruct(std::string_view column, uint64_t rowId,
+                              std::string_view key,
+                              std::span<const std::byte> flatBufferBytes) {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->PutRowStruct(column, rowId, key, flatBufferBytes);
 }
 
 Status Database::PutRowStructs(std::string_view column, uint64_t rowId,

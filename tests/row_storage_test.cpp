@@ -1,5 +1,6 @@
 #include "test_utils.h"
 
+#include <string>
 #include <vector>
 
 namespace {
@@ -52,6 +53,41 @@ TEST(RowStorageTest, RejectsEmptyRow) {
   ASSERT_OK(database.Open(directory));
   EXPECT_EQ(database.PutRowStructs("StructA", 1, {}).Code(),
             LumoDB::StatusCode::kInvalidArgument);
+  ASSERT_OK(database.Close());
+}
+
+TEST(RowStorageTest, PutRowStructAddsKeysSeriallyWithinRow) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("row-storage-single-key");
+
+  LumoDB::DatabaseOptions options;
+  options.initialRowBucketCount = 16;
+  options.rowShardCount = 4;
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  ASSERT_OK(
+      database.PutRowStruct("StructA", 42, "first", LumoDB::test::MakeBytes("one")));
+  ASSERT_OK(
+      database.PutRowStruct("StructA", 42, "second", LumoDB::test::MakeBytes("two")));
+  ASSERT_OK(database.PutRowStruct("StructA", 42, "first",
+                                  LumoDB::test::MakeBytes("one-updated")));
+
+  EXPECT_EQ(database.RowCount(), 1);
+
+  std::vector<std::byte> value;
+  ASSERT_OK(database.GetRowStruct("StructA", 42, "first", value));
+  EXPECT_EQ(LumoDB::test::BytesToString(value), "one-updated");
+  ASSERT_OK(database.GetRowStruct("StructA", 42, "second", value));
+  EXPECT_EQ(LumoDB::test::BytesToString(value), "two");
+
+  ASSERT_OK(database.Close());
+  ASSERT_OK(database.Open(directory, options));
+  ASSERT_OK(database.GetRowStruct("StructA", 42, "first", value));
+  EXPECT_EQ(LumoDB::test::BytesToString(value), "one-updated");
+  ASSERT_OK(database.GetRowStruct("StructA", 42, "second", value));
+  EXPECT_EQ(LumoDB::test::BytesToString(value), "two");
   ASSERT_OK(database.Close());
 }
 
