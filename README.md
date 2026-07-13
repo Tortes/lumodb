@@ -11,7 +11,7 @@ binary payloads can be written and read back without coupling the database layer
 to a serializer.
 
 ```text
-Column + Key          -> mmap hash index -> append-only value offset
+Column + Key          -> mmap hash index -> append-only record offset
 Column + RowId + Key  -> row index       -> row block local key index
 ```
 
@@ -23,6 +23,7 @@ Column + RowId + Key  -> row index       -> row block local key index
 - `Column + RowId + Key` addressing for row-partitioned object maps.
 - Row blocks with local key indexes for efficient row-level grouping.
 - Mutex-free row write hot path for distinct row ids in a preallocated row index.
+- Read-only mmap mode for indexes and value files after the write phase.
 - Index rebuild by scanning append-only value files.
 
 LumoDB intentionally does not implement SQL, range scans, deletion,
@@ -30,12 +31,12 @@ transactions, or compaction. It is focused on exact-key whole-object readback.
 
 ## Storage Format
 
-![LumoDB storage format](docs/assets/lumodb-storage-format.png)
-
 The format is split into four structures:
 
-- `Value File`: append-only records for the simple object path.
-- `Object Index`: mmap hash buckets pointing into `values.lumov`.
+- `Value File`: append-only records with a 24-byte header, column bytes, key
+  bytes, and value bytes.
+- `Object Index`: 16-byte mmap hash buckets containing a combined hash and the
+  record offset in `values.lumov`.
 - `Row Index`: mmap hash buckets mapping `(column, rowId)` to a row block.
 - `Row Block`: one row-local key index plus packed key/value byte regions.
 
@@ -77,7 +78,7 @@ mmap object index:
 ```text
 PutStruct(column, key, bytes)
   -> values.lumov append record
-  -> index.lumoi maps column/key to offset/size
+  -> index.lumoi maps column/key to record offset
 ```
 
 Row storage groups many keyed objects into one row block. Each row block has a
@@ -102,7 +103,9 @@ values reserve append offsets with atomics, write disjoint file ranges with
 `InvalidArgument` instead of resizing the mmap row index on the write path.
 
 Reads are direct point reads. The caller is expected to know `column`, `rowId`,
-and `key`; LumoDB does not scan rows to discover objects.
+and `key`; LumoDB does not scan rows to discover objects. A row point lookup
+reads only its row header, probed key buckets, the matching key, and its value;
+it does not load the entire row block.
 
 ## Files
 
@@ -124,7 +127,10 @@ database-directory/
 ```
 
 If an index file is missing or invalid, LumoDB rebuilds it by scanning the
-corresponding append-only value files.
+corresponding append-only value files. Databases written with the preceding
+48-byte object record header are migrated to the compact format during the next
+read-write `Open`, then the object index is rebuilt. Open such a database once
+in read-write mode before using `OpenReadOnly`.
 
 ## API
 
@@ -150,6 +156,15 @@ std::vector<LumoDB::StructEntry> entries = {
     {.key = "object-b", .flatBufferBytes = objectB},
 };
 db.PutStructs("StructA", entries);
+```
+
+For immutable object keys, use `PutUniqueStructs`. It avoids the record reads
+needed by the overwrite-compatible API and is the intended bulk-write path for
+data that is written exactly once. The caller must ensure that every
+`(column, key)` is new, including within the submitted batch.
+
+```cpp
+db.PutUniqueStructs("StructA", entries);
 ```
 
 ### Row API
@@ -180,6 +195,26 @@ std::vector<LumoDB::RowStructEntry> entries = {
 };
 
 db.PutRowStructs("StructA", 42, entries);
+```
+
+For an immutable row, build its complete key map first and call
+`PutRowStructs` once. Calls for distinct `rowId` values may run in parallel,
+including under the same column. Calls that replace or extend the same row are
+serialized by the caller and use the overwrite-compatible `PutRowStruct` API.
+
+### Read-Only Phase
+
+`Close` synchronizes value files before index files. Reopen a completed
+database with the same storage options through `OpenReadOnly`; indexes and
+value files are mapped read-only and writes return `InvalidArgument`.
+
+```cpp
+LumoDB::Database db;
+db.OpenReadOnly("/tmp/lumodb", options);
+
+std::vector<std::byte> loaded;
+db.GetRowStruct("StructA", 42, "object-a", loaded);
+db.Close();
 ```
 
 ### Diagnostics
@@ -224,9 +259,9 @@ ctest --test-dir build --output-on-failure
 
 The default test suite includes focused unit tests plus system tests:
 
-- `lumodb_tests`: KV put/get, struct byte payloads, row block lookup, object
-  index rebuild, row index rebuild, and concurrent independent row writes under
-  the same column.
+- `lumodb_tests`: KV put/get, generic and immutable struct writes, compact
+  object indexes, read-only reopen, sparse row point lookup, index rebuild,
+  and concurrent independent row writes under the same column.
 - `lumodb_system_tests`: end-to-end object write/read, row write/read,
   reopen/readback, same-column parallel row writes, and parallel row reads.
 
@@ -244,8 +279,9 @@ Object benchmark:
 ./build/lumodb_bench --dir /tmp/lumodb-bench --sizes 1,5,10 --read-count 100
 ```
 
-Use `--object-batch-size 256` to measure batched object writes. The benchmark
-reports payload preparation separately from database write and flush time.
+Use `--object-batch-size 256` to measure batched immutable object writes. The
+benchmark reports payload preparation separately from database write and close
+time, then measures point reads after an `OpenReadOnly` reopen.
 
 Parallel row benchmark:
 
@@ -253,15 +289,6 @@ Parallel row benchmark:
 ./build/lumodb_bench --mode row-parallel --dir /tmp/lumodb-bench \
   --sizes 1,5,10 --read-count 100 --row-entries 64 --threads 8 --shards 8
 ```
-
-Recent local result on an 8-core machine, using 4 KiB payloads and 100 random
-reads:
-
-| Mode | Size | Objects | Rows | Write Time | Throughput |
-|---|---:|---:|---:|---:|---:|
-| row-parallel | 1GB | 262,144 | 4,096 | 0.654s | 1566.91 MB/s |
-| row-parallel | 5GB | 1,310,720 | 20,480 | 3.281s | 1560.63 MB/s |
-| row-parallel | 10GB | 2,621,440 | 40,960 | 6.465s | 1584.01 MB/s |
 
 ## Project Layout
 
@@ -271,9 +298,6 @@ reads:
 ├── README.md
 ├── bench/
 │   └── benchmark.cpp
-├── docs/
-│   └── assets/
-│       └── lumodb-storage-format.png
 ├── schemas/
 │   └── example.fbs
 ├── src/

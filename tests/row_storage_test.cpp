@@ -91,4 +91,30 @@ TEST(RowStorageTest, PutRowStructAddsKeysSeriallyWithinRow) {
   ASSERT_OK(database.Close());
 }
 
+TEST(RowStorageTest, ReadsSingleValueFromLargeRow) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("row-storage-sparse-read");
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory));
+
+  const std::vector<std::byte> target = LumoDB::test::MakeBytes("target-value");
+  const std::vector<std::byte> largeValue(1024 * 1024, std::byte{0x5a});
+  std::vector<LumoDB::RowStructEntry> entries = {
+      {.key = "target", .flatBufferBytes = target},
+  };
+  std::vector<std::string> largeKeys;
+  largeKeys.reserve(8);
+  for (uint64_t index = 0; index < 8; ++index) {
+    largeKeys.push_back("large-" + std::to_string(index));
+    entries.push_back({.key = largeKeys.back(), .flatBufferBytes = largeValue});
+  }
+  ASSERT_OK(database.PutRowStructs("StructA", 99, entries));
+
+  std::vector<std::byte> value;
+  ASSERT_OK(database.GetRowStruct("StructA", 99, "target", value));
+  EXPECT_EQ(LumoDB::test::BytesToString(value), "target-value");
+  ASSERT_OK(database.Close());
+}
+
 }  // namespace

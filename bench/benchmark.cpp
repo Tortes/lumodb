@@ -187,7 +187,8 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
 
   LumoDB::DatabaseOptions databaseOptions;
   databaseOptions.initialBucketCount =
-      RoundUpPowerOfTwo(static_cast<uint64_t>(objectCount / 0.70) + 1);
+      RoundUpPowerOfTwo(
+          static_cast<uint64_t>(objectCount / databaseOptions.maxLoadFactor) + 1);
 
   LumoDB::Database database;
   LumoDB::Status status = database.Open(runDirectory, databaseOptions);
@@ -220,7 +221,7 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
     prepareDuration += prepareEnd - prepareStart;
 
     const auto databaseWriteStart = std::chrono::steady_clock::now();
-    status = database.PutStructs("StructA", entries);
+    status = database.PutUniqueStructs("StructA", entries);
     const auto databaseWriteEnd = std::chrono::steady_clock::now();
     databaseWriteDuration += databaseWriteEnd - databaseWriteStart;
     if (!status) {
@@ -228,15 +229,21 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
       std::exit(EXIT_FAILURE);
     }
   }
-  const auto flushStart = std::chrono::steady_clock::now();
-  status = database.Flush();
-  const auto flushEnd = std::chrono::steady_clock::now();
-  databaseWriteDuration += flushEnd - flushStart;
+  const auto closeStart = std::chrono::steady_clock::now();
+  status = database.Close();
+  const auto closeEnd = std::chrono::steady_clock::now();
+  databaseWriteDuration += closeEnd - closeStart;
   if (!status) {
-    std::cerr << "flush failed: " << status.Message() << '\n';
+    std::cerr << "close failed: " << status.Message() << '\n';
     std::exit(EXIT_FAILURE);
   }
   auto writeEnd = std::chrono::steady_clock::now();
+
+  status = database.OpenReadOnly(runDirectory, databaseOptions);
+  if (!status) {
+    std::cerr << "read-only open failed: " << status.Message() << '\n';
+    std::exit(EXIT_FAILURE);
+  }
 
   std::mt19937_64 random(42);
   std::vector<std::chrono::steady_clock::duration> readDurations;
@@ -293,7 +300,8 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
   LumoDB::DatabaseOptions databaseOptions;
   databaseOptions.initialBucketCount = 16;
   databaseOptions.initialRowBucketCount =
-      RoundUpPowerOfTwo(static_cast<uint64_t>(rowCount / 0.70) + 1);
+      RoundUpPowerOfTwo(
+          static_cast<uint64_t>(rowCount / databaseOptions.maxLoadFactor) + 1);
   databaseOptions.rowShardCount = options.shards;
 
   LumoDB::Database database;
@@ -373,11 +381,11 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
     std::exit(EXIT_FAILURE);
   }
 
-  const auto flushStart = std::chrono::steady_clock::now();
-  status = database.Flush();
-  const auto flushEnd = std::chrono::steady_clock::now();
+  const auto closeStart = std::chrono::steady_clock::now();
+  status = database.Close();
+  const auto closeEnd = std::chrono::steady_clock::now();
   if (!status) {
-    std::cerr << "flush failed: " << status.Message() << '\n';
+    std::cerr << "close failed: " << status.Message() << '\n';
     std::exit(EXIT_FAILURE);
   }
   auto writeEnd = std::chrono::steady_clock::now();
@@ -385,7 +393,13 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
       std::memory_order_relaxed));
   const auto databaseWriteDuration =
       std::chrono::nanoseconds(databaseWriteNanos.load(std::memory_order_relaxed)) +
-      (flushEnd - flushStart);
+      (closeEnd - closeStart);
+
+  status = database.OpenReadOnly(runDirectory, databaseOptions);
+  if (!status) {
+    std::cerr << "read-only open failed: " << status.Message() << '\n';
+    std::exit(EXIT_FAILURE);
+  }
 
   std::mt19937_64 random(42);
   std::vector<std::chrono::steady_clock::duration> readDurations;

@@ -48,6 +48,7 @@ class MappedFile {
   MappedFile& operator=(MappedFile&& other) noexcept;
 
   Status Map(int fd, uint64_t size);
+  Status MapReadOnly(int fd, uint64_t size);
   Status Sync();
   void Unmap();
 
@@ -56,12 +57,16 @@ class MappedFile {
   [[nodiscard]] bool IsMapped() const { return data_ != nullptr; }
 
  private:
+  Status MapWithProtection(int fd, uint64_t size, int protection);
+
   void* data_ = nullptr;
   uint64_t size_ = 0;
+  bool writable_ = false;
 };
 
 Status EnsureDirectory(const std::filesystem::path& directory);
 Status OpenReadWriteCreate(const std::filesystem::path& path, FileDescriptor& fd);
+Status OpenReadOnly(const std::filesystem::path& path, FileDescriptor& fd);
 Status GetFileSize(int fd, uint64_t& size);
 Status TruncateFile(int fd, uint64_t size);
 Status SyncFile(int fd);

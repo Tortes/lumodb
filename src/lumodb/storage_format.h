@@ -10,9 +10,11 @@ static_assert(std::endian::native == std::endian::little,
               "LumoDB currently stores fixed headers in little-endian form");
 
 inline constexpr std::array<char, 8> kValueFileMagic = {'L', 'U', 'M', 'V',
-                                                        '0', '0', '0', '1'};
+                                                        '0', '0', '0', '2'};
+inline constexpr std::array<char, 8> kLegacyValueFileMagic = {'L', 'U', 'M', 'V',
+                                                              '0', '0', '0', '1'};
 inline constexpr std::array<char, 8> kIndexFileMagic = {'L', 'U', 'M', 'I',
-                                                        '0', '0', '0', '1'};
+                                                        '0', '0', '0', '2'};
 inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R',
                                                            'V', '0', '0', '1'};
 inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R',
@@ -37,6 +39,15 @@ struct ValueRecordHeader {
   uint32_t magic = kRecordMagic;
   uint16_t version = kStorageVersion;
   uint16_t headerSize = sizeof(ValueRecordHeader);
+  uint32_t columnSize = 0;
+  uint32_t keySize = 0;
+  uint64_t valueSize = 0;
+};
+
+struct LegacyValueRecordHeader {
+  uint32_t magic = kRecordMagic;
+  uint16_t version = kStorageVersion;
+  uint16_t headerSize = sizeof(LegacyValueRecordHeader);
   uint64_t sequence = 0;
   uint64_t columnHash = 0;
   uint64_t keyHash = 0;
@@ -56,15 +67,8 @@ struct IndexFileHeader {
 };
 
 struct IndexBucket {
-  uint8_t state = kBucketEmpty;
-  std::array<uint8_t, 7> reserved = {};
-  uint64_t columnHash = 0;
-  uint64_t keyHash = 0;
+  uint64_t hash = 0;
   uint64_t recordOffset = 0;
-  uint64_t valueOffset = 0;
-  uint64_t valueSize = 0;
-  uint64_t recordSize = 0;
-  uint64_t sequence = 0;
 };
 
 struct RowValueFileHeader {
@@ -125,9 +129,10 @@ struct RowKeyBucket {
 };
 
 static_assert(sizeof(ValueFileHeader) == 24);
-static_assert(sizeof(ValueRecordHeader) == 48);
+static_assert(sizeof(ValueRecordHeader) == 24);
+static_assert(sizeof(LegacyValueRecordHeader) == 48);
 static_assert(sizeof(IndexFileHeader) == 64);
-static_assert(sizeof(IndexBucket) == 64);
+static_assert(sizeof(IndexBucket) == 16);
 static_assert(sizeof(RowValueFileHeader) == 24);
 static_assert(sizeof(RowIndexFileHeader) == 64);
 static_assert(sizeof(RowIndexBucket) == 64);

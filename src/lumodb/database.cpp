@@ -44,6 +44,11 @@ std::span<const std::byte> AsBytes(std::string_view value) {
   return {reinterpret_cast<const std::byte*>(value.data()), value.size()};
 }
 
+uint64_t ObjectIndexHash(uint64_t columnHash, uint64_t keyHash) {
+  const uint64_t hash = detail::MixHashes(columnHash, keyHash);
+  return hash == 0 ? 1 : hash;
+}
+
 std::string EscapeText(std::string_view value) {
   constexpr char kHexDigits[] = "0123456789abcdef";
 
@@ -96,12 +101,6 @@ std::string HexBytes(std::span<const std::byte> bytes) {
   return text;
 }
 
-template <typename T>
-void AppendPod(std::vector<std::byte>& output, const T& value) {
-  const auto* data = reinterpret_cast<const std::byte*>(&value);
-  output.insert(output.end(), data, data + sizeof(T));
-}
-
 void AppendBytes(std::vector<std::byte>& output, const void* data, size_t size) {
   if (size == 0) {
     return;
@@ -124,6 +123,16 @@ class Database::Impl {
   ~Impl() { static_cast<void>(Close()); }
 
   Status Open(const std::filesystem::path& directory, const DatabaseOptions& options) {
+    return OpenInternal(directory, options, false);
+  }
+
+  Status OpenReadOnly(const std::filesystem::path& directory,
+                      const DatabaseOptions& options) {
+    return OpenInternal(directory, options, true);
+  }
+
+  Status OpenInternal(const std::filesystem::path& directory,
+                      const DatabaseOptions& options, bool readOnly) {
     if (open_) {
       Status status = Close();
       if (!status) {
@@ -136,6 +145,7 @@ class Database::Impl {
 
     directory_ = directory;
     options_ = options;
+    readOnly_ = readOnly;
     rowPendingInsertCount_.store(0, std::memory_order_relaxed);
     options_.initialBucketCount = RoundUpPowerOfTwo(options_.initialBucketCount);
     options_.initialRowBucketCount = RoundUpPowerOfTwo(options_.initialRowBucketCount);
@@ -143,9 +153,18 @@ class Database::Impl {
       return Status::InvalidArgument("rowShardCount must be greater than zero");
     }
 
-    Status status = detail::EnsureDirectory(directory_);
-    if (!status) {
-      return status;
+    Status status = Status::Ok();
+    if (readOnly_) {
+      std::error_code error;
+      if (!std::filesystem::is_directory(directory_, error)) {
+        return Status::InvalidArgument("database directory does not exist: " +
+                                       directory_.string());
+      }
+    } else {
+      status = detail::EnsureDirectory(directory_);
+      if (!status) {
+        return status;
+      }
     }
 
     valuePath_ = directory_ / "values.lumov";
@@ -187,14 +206,29 @@ class Database::Impl {
     Status status = Flush();
     CloseFiles();
     open_ = false;
+    readOnly_ = false;
     return status;
   }
 
   Status Flush() {
+    if (readOnly_) {
+      return Status::Ok();
+    }
     if (!indexMap_.IsMapped()) {
       return Status::Ok();
     }
     Status status = Status::Ok();
+    status = detail::SyncFile(valueFile_.Get());
+    if (!status) {
+      return status;
+    }
+    for (detail::FileDescriptor& rowValueFile : rowValueFiles_) {
+      status = detail::SyncFile(rowValueFile.Get());
+      if (!status) {
+        return status;
+      }
+    }
+
     status = rowIndexMap_.Sync();
     if (!status) {
       return status;
@@ -213,17 +247,6 @@ class Database::Impl {
     status = detail::SyncFile(indexFile_.Get());
     if (!status) {
       return status;
-    }
-    status = detail::SyncFile(valueFile_.Get());
-    if (!status) {
-      return status;
-    }
-
-    for (detail::FileDescriptor& rowValueFile : rowValueFiles_) {
-      status = detail::SyncFile(rowValueFile.Get());
-      if (!status) {
-        return status;
-      }
     }
     return Status::Ok();
   }
@@ -251,8 +274,21 @@ class Database::Impl {
   }
 
   Status PutStructs(std::string_view column, std::span<const StructEntry> entries) {
+    return WriteStructs(column, entries, false);
+  }
+
+  Status PutUniqueStructs(std::string_view column,
+                          std::span<const StructEntry> entries) {
+    return WriteStructs(column, entries, true);
+  }
+
+  Status WriteStructs(std::string_view column, std::span<const StructEntry> entries,
+                      bool keysAreUnique) {
     if (!open_) {
       return Status::NotOpen("database is not open");
+    }
+    if (readOnly_) {
+      return Status::InvalidArgument("database is read-only");
     }
     if (!FitsUint32(column.size())) {
       return Status::InvalidArgument("column must fit in uint32 length");
@@ -275,13 +311,12 @@ class Database::Impl {
       detail::ValueRecordHeader header;
       std::string_view key;
       std::span<const std::byte> value;
+      uint64_t keyHash = 0;
       uint64_t recordOffset = 0;
-      uint64_t valueOffset = 0;
       uint64_t recordSize = 0;
     };
 
     const uint64_t columnHash = detail::HashString(column);
-    uint64_t nextSequence = IndexHeader()->nextSequence;
     uint64_t nextAppendOffset = appendOffset_;
     std::vector<PendingRecord> pending;
     pending.reserve(entries.size());
@@ -293,14 +328,9 @@ class Database::Impl {
       record.key = entry.key;
       record.value = entry.flatBufferBytes;
       record.recordOffset = nextAppendOffset;
-      record.valueOffset =
-          record.recordOffset + sizeof(detail::ValueRecordHeader) + column.size() +
-          entry.key.size();
       record.recordSize = sizeof(detail::ValueRecordHeader) + column.size() +
                           entry.key.size() + entry.flatBufferBytes.size();
-      record.header.sequence = nextSequence++;
-      record.header.columnHash = columnHash;
-      record.header.keyHash = detail::HashString(entry.key);
+      record.keyHash = detail::HashString(entry.key);
       record.header.columnSize = static_cast<uint32_t>(column.size());
       record.header.keySize = static_cast<uint32_t>(entry.key.size());
       record.header.valueSize = entry.flatBufferBytes.size();
@@ -319,28 +349,30 @@ class Database::Impl {
     }
 
     for (const PendingRecord& record : pending) {
+      detail::IndexBucket bucket;
+      bucket.hash = ObjectIndexHash(columnHash, record.keyHash);
+      bucket.recordOffset = record.recordOffset;
+
+      if (keysAreUnique) {
+        status = PlaceNewBucket(bucket);
+        if (!status) {
+          return status;
+        }
+        ++IndexHeader()->itemCount;
+        continue;
+      }
+
       BucketLookup lookup;
-      status = FindBucket(column, record.key, columnHash, record.header.keyHash, lookup);
+      status = FindBucket(column, record.key, columnHash, record.keyHash, lookup);
       if (!status) {
         return status;
       }
-
-      detail::IndexBucket bucket;
-      bucket.state = detail::kBucketFilled;
-      bucket.columnHash = columnHash;
-      bucket.keyHash = record.header.keyHash;
-      bucket.recordOffset = record.recordOffset;
-      bucket.valueOffset = record.valueOffset;
-      bucket.valueSize = record.value.size();
-      bucket.recordSize = record.recordSize;
-      bucket.sequence = record.header.sequence;
 
       Buckets()[lookup.index] = bucket;
       if (!lookup.found) {
         ++IndexHeader()->itemCount;
       }
     }
-    IndexHeader()->nextSequence = nextSequence;
     appendOffset_ = nextAppendOffset;
     return Status::Ok();
   }
@@ -364,15 +396,29 @@ class Database::Impl {
     }
 
     const detail::IndexBucket& bucket = Buckets()[lookup.index];
-    flatBufferBytes.resize(static_cast<size_t>(bucket.valueSize));
-    return detail::ReadAllAt(valueFile_.Get(), flatBufferBytes.data(),
-                             flatBufferBytes.size(), bucket.valueOffset);
+    detail::ValueRecordHeader recordHeader;
+    status = ReadValueAt(&recordHeader, sizeof(recordHeader), bucket.recordOffset);
+    if (!status) {
+      return status;
+    }
+    if (!IsValidRecordHeader(recordHeader)) {
+      return Status::Corruption("index points to an invalid value record");
+    }
+
+    const uint64_t valueOffset =
+        bucket.recordOffset + sizeof(detail::ValueRecordHeader) +
+        recordHeader.columnSize + recordHeader.keySize;
+    flatBufferBytes.resize(static_cast<size_t>(recordHeader.valueSize));
+    return ReadValueAt(flatBufferBytes.data(), flatBufferBytes.size(), valueOffset);
   }
 
   Status PutRowStruct(std::string_view column, uint64_t rowId, std::string_view key,
                       std::span<const std::byte> flatBufferBytes) {
     if (!open_) {
       return Status::NotOpen("database is not open");
+    }
+    if (readOnly_) {
+      return Status::InvalidArgument("database is read-only");
     }
     if (!FitsUint32(column.size()) || !FitsUint32(key.size())) {
       return Status::InvalidArgument("column and key must fit in uint32 length");
@@ -420,6 +466,9 @@ class Database::Impl {
     if (!open_) {
       return Status::NotOpen("database is not open");
     }
+    if (readOnly_) {
+      return Status::InvalidArgument("database is read-only");
+    }
     if (!FitsUint32(column.size())) {
       return Status::InvalidArgument("column must fit in uint32 length");
     }
@@ -439,8 +488,8 @@ class Database::Impl {
     }
 
     const uint64_t sequence = NextRowSequence();
-    std::vector<std::byte> block;
-    status = BuildRowBlock(column, rowId, entries, sequence, columnHash, block);
+    RowBlockLayout layout;
+    status = BuildRowBlockLayout(column, rowId, entries, sequence, columnHash, layout);
     if (!status) {
       if (reserved) {
         ReleaseRowIndexInsertSlot();
@@ -450,9 +499,19 @@ class Database::Impl {
 
     const uint32_t shardId = ShardForRow(columnHash, rowId);
     const uint64_t blockOffset = rowAppendOffsets_[shardId]->fetch_add(
-        static_cast<uint64_t>(block.size()), std::memory_order_relaxed);
-    status = detail::WriteAllAt(rowValueFiles_[shardId].Get(), block.data(),
-                                block.size(), blockOffset);
+        layout.header.blockSize, std::memory_order_relaxed);
+    std::vector<detail::WriteSlice> blockSlices;
+    blockSlices.reserve(4 + layout.valueEntries.size());
+    blockSlices.push_back({.data = &layout.header, .size = sizeof(layout.header)});
+    blockSlices.push_back({.data = layout.keyBuckets.data(),
+                           .size = layout.keyBuckets.size() * sizeof(detail::RowKeyBucket)});
+    blockSlices.push_back({.data = column.data(), .size = column.size()});
+    blockSlices.push_back({.data = layout.keyBytes.data(), .size = layout.keyBytes.size()});
+    for (const RowStructEntry* entry : layout.valueEntries) {
+      blockSlices.push_back(
+          {.data = entry->flatBufferBytes.data(), .size = entry->flatBufferBytes.size()});
+    }
+    status = detail::WriteVAllAt(rowValueFiles_[shardId].Get(), blockSlices, blockOffset);
     if (!status) {
       if (reserved) {
         ReleaseRowIndexInsertSlot();
@@ -465,7 +524,7 @@ class Database::Impl {
     bucket.rowId = rowId;
     bucket.shardId = shardId;
     bucket.blockOffset = blockOffset;
-    bucket.blockSize = static_cast<uint64_t>(block.size());
+    bucket.blockSize = layout.header.blockSize;
     bucket.sequence = sequence;
 
     bool inserted = false;
@@ -500,18 +559,8 @@ class Database::Impl {
     if (!lookup.found) {
       return Status::NotFound("row not found");
     }
-
-    detail::RowIndexBucket bucket;
-    status = LoadFilledRowBucketSnapshot(lookup.index, bucket);
-    if (!status) {
-      return status;
-    }
-    std::vector<std::byte> block;
-    status = LoadRowBlock(bucket, block);
-    if (!status) {
-      return status;
-    }
-    return FindValueInRowBlock(block, column, rowId, key, flatBufferBytes);
+    return FindValueInRowBlockAt(lookup.bucket, lookup.blockHeader, key,
+                                 flatBufferBytes);
   }
 
   Status GetMany(std::string_view column, const std::vector<std::string>& keys,
@@ -543,16 +592,13 @@ class Database::Impl {
     std::map<std::string, ColumnStats> columns;
     for (uint64_t index = 0; index < IndexHeader()->bucketCount; ++index) {
       const detail::IndexBucket& bucket = Buckets()[index];
-      if (bucket.state == detail::kBucketEmpty) {
+      if (bucket.hash == 0) {
         continue;
-      }
-      if (bucket.state != detail::kBucketFilled) {
-        return Status::Corruption("object index bucket state is invalid");
       }
 
       detail::ValueRecordHeader recordHeader;
-      Status status = detail::ReadAllAt(valueFile_.Get(), &recordHeader,
-                                        sizeof(recordHeader), bucket.recordOffset);
+      Status status = ReadValueAt(&recordHeader, sizeof(recordHeader),
+                                  bucket.recordOffset);
       if (!status) {
         return status;
       }
@@ -585,8 +631,8 @@ class Database::Impl {
       }
 
       detail::RowBlockHeader blockHeader;
-      status = detail::ReadAllAt(rowValueFiles_[bucket.shardId].Get(), &blockHeader,
-                                 sizeof(blockHeader), bucket.blockOffset);
+      status = ReadRowValueAt(bucket.shardId, &blockHeader, sizeof(blockHeader),
+                              bucket.blockOffset);
       if (!status) {
         return status;
       }
@@ -637,21 +683,17 @@ class Database::Impl {
 
     output << "LumoDB dump\n";
     output << "object_index: entries=" << EntryCount()
-           << " buckets=" << BucketCount()
-           << " next_sequence=" << IndexHeader()->nextSequence << '\n';
+           << " buckets=" << BucketCount() << '\n';
     output << "objects:\n";
     for (uint64_t index = 0; index < IndexHeader()->bucketCount; ++index) {
       const detail::IndexBucket& bucket = Buckets()[index];
-      if (bucket.state == detail::kBucketEmpty) {
+      if (bucket.hash == 0) {
         continue;
-      }
-      if (bucket.state != detail::kBucketFilled) {
-        return Status::Corruption("object index bucket state is invalid");
       }
 
       detail::ValueRecordHeader recordHeader;
-      Status status = detail::ReadAllAt(valueFile_.Get(), &recordHeader,
-                                        sizeof(recordHeader), bucket.recordOffset);
+      Status status = ReadValueAt(&recordHeader, sizeof(recordHeader),
+                                  bucket.recordOffset);
       if (!status) {
         return status;
       }
@@ -665,9 +707,14 @@ class Database::Impl {
       if (!status) {
         return status;
       }
-      std::vector<std::byte> value(static_cast<size_t>(bucket.valueSize));
-      status = detail::ReadAllAt(valueFile_.Get(), value.data(), value.size(),
-                                 bucket.valueOffset);
+      const uint64_t valueOffset =
+          bucket.recordOffset + sizeof(detail::ValueRecordHeader) +
+          recordHeader.columnSize + recordHeader.keySize;
+      const uint64_t recordSize = sizeof(detail::ValueRecordHeader) +
+                                  recordHeader.columnSize + recordHeader.keySize +
+                                  recordHeader.valueSize;
+      std::vector<std::byte> value(static_cast<size_t>(recordHeader.valueSize));
+      status = ReadValueAt(value.data(), value.size(), valueOffset);
       if (!status) {
         return status;
       }
@@ -675,13 +722,13 @@ class Database::Impl {
       output << "  object bucket=" << index
              << " column=" << EscapeText(column)
              << " key=" << EscapeText(key)
-             << " sequence=" << bucket.sequence
-             << " column_hash=" << bucket.columnHash
-             << " key_hash=" << bucket.keyHash
+             << " column_hash=" << detail::HashString(column)
+             << " key_hash=" << detail::HashString(key)
+             << " index_hash=" << bucket.hash
              << " record_offset=" << bucket.recordOffset
-             << " value_offset=" << bucket.valueOffset
-             << " value_size=" << bucket.valueSize
-             << " record_size=" << bucket.recordSize
+             << " value_offset=" << valueOffset
+             << " value_size=" << recordHeader.valueSize
+             << " record_size=" << recordSize
              << " value_hex=" << HexBytes(value) << '\n';
     }
 
@@ -797,6 +844,8 @@ class Database::Impl {
   struct RowBucketLookup {
     uint64_t index = 0;
     bool found = false;
+    detail::RowIndexBucket bucket = {};
+    detail::RowBlockHeader blockHeader = {};
   };
 
   struct RowBucketData {
@@ -806,6 +855,13 @@ class Database::Impl {
     uint64_t blockOffset = 0;
     uint64_t blockSize = 0;
     uint64_t sequence = 0;
+  };
+
+  struct RowBlockLayout {
+    detail::RowBlockHeader header;
+    std::vector<detail::RowKeyBucket> keyBuckets;
+    std::vector<std::byte> keyBytes;
+    std::vector<const RowStructEntry*> valueEntries;
   };
 
   enum class RowBucketSnapshotState {
@@ -853,7 +909,41 @@ class Database::Impl {
         base + sizeof(detail::RowIndexFileHeader));
   }
 
+  Status ReadValueAt(void* data, size_t size, uint64_t offset) const {
+    if (!valueMap_.IsMapped()) {
+      return detail::ReadAllAt(valueFile_.Get(), data, size, offset);
+    }
+    if (offset > valueMap_.Size() || size > valueMap_.Size() - offset) {
+      return Status::Corruption("value read extends beyond file size");
+    }
+    if (size != 0) {
+      const auto* source = static_cast<const std::byte*>(valueMap_.Data()) + offset;
+      std::memcpy(data, source, size);
+    }
+    return Status::Ok();
+  }
+
+  Status ReadRowValueAt(uint32_t shardId, void* data, size_t size,
+                        uint64_t offset) const {
+    if (shardId >= rowValueFiles_.size()) {
+      return Status::Corruption("row index points to an invalid shard");
+    }
+    if (shardId >= rowValueMaps_.size() || !rowValueMaps_[shardId].IsMapped()) {
+      return detail::ReadAllAt(rowValueFiles_[shardId].Get(), data, size, offset);
+    }
+    const detail::MappedFile& valueMap = rowValueMaps_[shardId];
+    if (offset > valueMap.Size() || size > valueMap.Size() - offset) {
+      return Status::Corruption("row value read extends beyond file size");
+    }
+    if (size != 0) {
+      const auto* source = static_cast<const std::byte*>(valueMap.Data()) + offset;
+      std::memcpy(data, source, size);
+    }
+    return Status::Ok();
+  }
+
   void CloseFiles() {
+    rowValueMaps_.clear();
     rowIndexMap_.Unmap();
     rowIndexFile_.Reset();
     rowValueFiles_.clear();
@@ -861,12 +951,14 @@ class Database::Impl {
     rowPendingInsertCount_.store(0, std::memory_order_relaxed);
     indexMap_.Unmap();
     indexFile_.Reset();
+    valueMap_.Unmap();
     valueFile_.Reset();
     appendOffset_ = 0;
   }
 
   Status OpenValueFile() {
-    Status status = detail::OpenReadWriteCreate(valuePath_, valueFile_);
+    Status status = readOnly_ ? detail::OpenReadOnly(valuePath_, valueFile_)
+                              : detail::OpenReadWriteCreate(valuePath_, valueFile_);
     if (!status) {
       return status;
     }
@@ -878,6 +970,9 @@ class Database::Impl {
     }
 
     if (fileSize == 0) {
+      if (readOnly_) {
+        return Status::Corruption("value file is empty");
+      }
       detail::ValueFileHeader header;
       status =
           detail::WriteAllAt(valueFile_.Get(), &header, sizeof(header), 0);
@@ -897,6 +992,15 @@ class Database::Impl {
     if (!status) {
       return status;
     }
+    if (MagicEquals(header.magic, detail::kLegacyValueFileMagic) &&
+        header.version == detail::kStorageVersion &&
+        header.headerSize == sizeof(detail::ValueFileHeader)) {
+      if (readOnly_) {
+        return Status::InvalidArgument(
+            "legacy value file requires a read-write open for migration");
+      }
+      return MigrateLegacyValueFile(fileSize);
+    }
     if (!MagicEquals(header.magic, detail::kValueFileMagic) ||
         header.version != detail::kStorageVersion ||
         header.headerSize != sizeof(detail::ValueFileHeader)) {
@@ -904,11 +1008,117 @@ class Database::Impl {
     }
 
     appendOffset_ = fileSize;
+    if (readOnly_) {
+      return valueMap_.MapReadOnly(valueFile_.Get(), fileSize);
+    }
+    return Status::Ok();
+  }
+
+  Status MigrateLegacyValueFile(uint64_t legacyFileSize) {
+    std::filesystem::path migrationPath = valuePath_;
+    migrationPath += ".migrating";
+
+    detail::FileDescriptor migrationFile;
+    Status status = detail::OpenReadWriteCreate(migrationPath, migrationFile);
+    if (!status) {
+      return status;
+    }
+    status = detail::TruncateFile(migrationFile.Get(), 0);
+    if (!status) {
+      return status;
+    }
+
+    detail::ValueFileHeader newFileHeader;
+    status = detail::WriteAllAt(migrationFile.Get(), &newFileHeader,
+                                sizeof(newFileHeader), 0);
+    if (!status) {
+      return status;
+    }
+
+    std::vector<std::byte> copyBuffer(1024 * 1024);
+    uint64_t sourceOffset = sizeof(detail::ValueFileHeader);
+    uint64_t destinationOffset = sizeof(detail::ValueFileHeader);
+    while (sourceOffset < legacyFileSize) {
+      detail::LegacyValueRecordHeader legacyHeader;
+      status = detail::ReadAllAt(valueFile_.Get(), &legacyHeader,
+                                 sizeof(legacyHeader), sourceOffset);
+      if (!status) {
+        return status;
+      }
+      if (!IsValidLegacyRecordHeader(legacyHeader)) {
+        return Status::Corruption("legacy value record header is invalid");
+      }
+
+      const uint64_t recordDataSize = legacyHeader.columnSize + legacyHeader.keySize +
+                                      legacyHeader.valueSize;
+      const uint64_t legacyRecordSize = sizeof(legacyHeader) + recordDataSize;
+      if (legacyRecordSize > legacyFileSize - sourceOffset) {
+        return Status::Corruption("legacy value record extends beyond file size");
+      }
+
+      detail::ValueRecordHeader recordHeader;
+      recordHeader.columnSize = legacyHeader.columnSize;
+      recordHeader.keySize = legacyHeader.keySize;
+      recordHeader.valueSize = legacyHeader.valueSize;
+      status = detail::WriteAllAt(migrationFile.Get(), &recordHeader,
+                                  sizeof(recordHeader), destinationOffset);
+      if (!status) {
+        return status;
+      }
+
+      uint64_t remaining = recordDataSize;
+      uint64_t recordSourceOffset = sourceOffset + sizeof(legacyHeader);
+      uint64_t recordDestinationOffset = destinationOffset + sizeof(recordHeader);
+      while (remaining > 0) {
+        const size_t chunkSize = static_cast<size_t>(
+            std::min<uint64_t>(remaining, copyBuffer.size()));
+        status = detail::ReadAllAt(valueFile_.Get(), copyBuffer.data(), chunkSize,
+                                   recordSourceOffset);
+        if (!status) {
+          return status;
+        }
+        status = detail::WriteAllAt(migrationFile.Get(), copyBuffer.data(), chunkSize,
+                                    recordDestinationOffset);
+        if (!status) {
+          return status;
+        }
+        remaining -= chunkSize;
+        recordSourceOffset += chunkSize;
+        recordDestinationOffset += chunkSize;
+      }
+
+      sourceOffset += legacyRecordSize;
+      destinationOffset += sizeof(recordHeader) + recordDataSize;
+    }
+
+    status = detail::SyncFile(migrationFile.Get());
+    if (!status) {
+      return status;
+    }
+    migrationFile.Reset();
+    valueFile_.Reset();
+
+    std::error_code error;
+    std::filesystem::rename(migrationPath, valuePath_, error);
+    if (error) {
+      return Status::IoError("rename migrated value file: " + error.message());
+    }
+    std::filesystem::remove(indexPath_, error);
+    if (error) {
+      return Status::IoError("remove stale object index: " + error.message());
+    }
+
+    status = detail::OpenReadWriteCreate(valuePath_, valueFile_);
+    if (!status) {
+      return status;
+    }
+    appendOffset_ = destinationOffset;
     return Status::Ok();
   }
 
   Status OpenIndexFile() {
-    Status status = detail::OpenReadWriteCreate(indexPath_, indexFile_);
+    Status status = readOnly_ ? detail::OpenReadOnly(indexPath_, indexFile_)
+                              : detail::OpenReadWriteCreate(indexPath_, indexFile_);
     if (!status) {
       return status;
     }
@@ -919,9 +1129,14 @@ class Database::Impl {
       return status;
     }
 
+    if (readOnly_ && fileSize == 0) {
+      return Status::Corruption("index file is empty");
+    }
+
     bool shouldRebuild = fileSize == 0;
     if (!shouldRebuild) {
-      status = indexMap_.Map(indexFile_.Get(), fileSize);
+      status = readOnly_ ? indexMap_.MapReadOnly(indexFile_.Get(), fileSize)
+                         : indexMap_.Map(indexFile_.Get(), fileSize);
       if (!status) {
         return status;
       }
@@ -932,6 +1147,9 @@ class Database::Impl {
     }
 
     if (shouldRebuild) {
+      if (readOnly_) {
+        return Status::Corruption("index file must be valid in read-only mode");
+      }
       status = CreateEmptyIndex(options_.initialBucketCount);
       if (!status) {
         return status;
@@ -944,17 +1162,21 @@ class Database::Impl {
 
   Status OpenRowValueFiles() {
     rowValueFiles_.clear();
+    rowValueMaps_.clear();
     rowAppendOffsets_.clear();
     rowValueFiles_.resize(options_.rowShardCount);
+    rowValueMaps_.resize(options_.rowShardCount);
     rowAppendOffsets_.reserve(options_.rowShardCount);
     for (uint32_t shardId = 0; shardId < options_.rowShardCount; ++shardId) {
       rowAppendOffsets_.push_back(std::make_unique<std::atomic<uint64_t>>(0));
     }
 
     for (uint32_t shardId = 0; shardId < options_.rowShardCount; ++shardId) {
-      Status status =
-          detail::OpenReadWriteCreate(RowValuePath(directory_, shardId),
-                                      rowValueFiles_[shardId]);
+      Status status = readOnly_
+                          ? detail::OpenReadOnly(RowValuePath(directory_, shardId),
+                                                 rowValueFiles_[shardId])
+                          : detail::OpenReadWriteCreate(RowValuePath(directory_, shardId),
+                                                        rowValueFiles_[shardId]);
       if (!status) {
         return status;
       }
@@ -966,6 +1188,9 @@ class Database::Impl {
       }
 
       if (fileSize == 0) {
+        if (readOnly_) {
+          return Status::Corruption("row value file is empty");
+        }
         detail::RowValueFileHeader header;
         status = detail::WriteAllAt(rowValueFiles_[shardId].Get(), &header,
                                     sizeof(header), 0);
@@ -992,13 +1217,21 @@ class Database::Impl {
         return Status::Corruption("row value file header is invalid");
       }
       rowAppendOffsets_[shardId]->store(fileSize, std::memory_order_relaxed);
+      if (readOnly_) {
+        status = rowValueMaps_[shardId].MapReadOnly(rowValueFiles_[shardId].Get(),
+                                                    fileSize);
+        if (!status) {
+          return status;
+        }
+      }
     }
 
     return Status::Ok();
   }
 
   Status OpenRowIndexFile() {
-    Status status = detail::OpenReadWriteCreate(rowIndexPath_, rowIndexFile_);
+    Status status = readOnly_ ? detail::OpenReadOnly(rowIndexPath_, rowIndexFile_)
+                              : detail::OpenReadWriteCreate(rowIndexPath_, rowIndexFile_);
     if (!status) {
       return status;
     }
@@ -1009,9 +1242,14 @@ class Database::Impl {
       return status;
     }
 
+    if (readOnly_ && fileSize == 0) {
+      return Status::Corruption("row index file is empty");
+    }
+
     bool shouldRebuild = fileSize == 0;
     if (!shouldRebuild) {
-      status = rowIndexMap_.Map(rowIndexFile_.Get(), fileSize);
+      status = readOnly_ ? rowIndexMap_.MapReadOnly(rowIndexFile_.Get(), fileSize)
+                         : rowIndexMap_.Map(rowIndexFile_.Get(), fileSize);
       if (!status) {
         return status;
       }
@@ -1022,6 +1260,9 @@ class Database::Impl {
     }
 
     if (shouldRebuild) {
+      if (readOnly_) {
+        return Status::Corruption("row index file must be valid in read-only mode");
+      }
       status = CreateEmptyRowIndex(options_.initialRowBucketCount);
       if (!status) {
         return status;
@@ -1171,7 +1412,17 @@ class Database::Impl {
     const uint64_t expectedSize =
         sizeof(detail::IndexFileHeader) +
         header->bucketCount * sizeof(detail::IndexBucket);
-    return expectedSize == fileSize && header->itemCount <= header->bucketCount;
+    if (expectedSize != fileSize || header->itemCount > header->bucketCount) {
+      return false;
+    }
+
+    uint64_t filledCount = 0;
+    for (uint64_t index = 0; index < header->bucketCount; ++index) {
+      if (Buckets()[index].hash != 0) {
+        ++filledCount;
+      }
+    }
+    return filledCount == header->itemCount;
   }
 
   Status CreateEmptyIndex(uint64_t bucketCount) {
@@ -1204,7 +1455,6 @@ class Database::Impl {
     }
 
     uint64_t offset = sizeof(detail::ValueFileHeader);
-    uint64_t nextSequence = 1;
     while (offset < fileSize) {
       detail::ValueRecordHeader recordHeader;
       status =
@@ -1235,35 +1485,26 @@ class Database::Impl {
         return status;
       }
 
+      const uint64_t columnHash = detail::HashString(column);
+      const uint64_t keyHash = detail::HashString(key);
       BucketLookup lookup;
-      status = FindBucket(column, key, recordHeader.columnHash, recordHeader.keyHash,
-                          lookup);
+      status = FindBucket(column, key, columnHash, keyHash, lookup);
       if (!status) {
         return status;
       }
 
       detail::IndexBucket bucket;
-      bucket.state = detail::kBucketFilled;
-      bucket.columnHash = recordHeader.columnHash;
-      bucket.keyHash = recordHeader.keyHash;
+      bucket.hash = ObjectIndexHash(columnHash, keyHash);
       bucket.recordOffset = offset;
-      bucket.valueOffset =
-          offset + sizeof(detail::ValueRecordHeader) + recordHeader.columnSize +
-          recordHeader.keySize;
-      bucket.valueSize = recordHeader.valueSize;
-      bucket.recordSize = recordSize;
-      bucket.sequence = recordHeader.sequence;
 
       Buckets()[lookup.index] = bucket;
       if (!lookup.found) {
         ++IndexHeader()->itemCount;
       }
 
-      nextSequence = std::max(nextSequence, recordHeader.sequence + 1);
       offset += recordSize;
     }
 
-    IndexHeader()->nextSequence = nextSequence;
     appendOffset_ = fileSize;
     return Status::Ok();
   }
@@ -1274,6 +1515,13 @@ class Database::Impl {
            recordHeader.headerSize == sizeof(detail::ValueRecordHeader);
   }
 
+  bool IsValidLegacyRecordHeader(
+      const detail::LegacyValueRecordHeader& recordHeader) const {
+    return recordHeader.magic == detail::kRecordMagic &&
+           recordHeader.version == detail::kStorageVersion &&
+           recordHeader.headerSize == sizeof(detail::LegacyValueRecordHeader);
+  }
+
   Status ReadRecordColumnKey(uint64_t recordOffset,
                              const detail::ValueRecordHeader& recordHeader,
                              std::string& column, std::string& key) const {
@@ -1282,12 +1530,12 @@ class Database::Impl {
 
     uint64_t offset = recordOffset + sizeof(detail::ValueRecordHeader);
     Status status =
-        detail::ReadAllAt(valueFile_.Get(), column.data(), column.size(), offset);
+        ReadValueAt(column.data(), column.size(), offset);
     if (!status) {
       return status;
     }
     offset += column.size();
-    return detail::ReadAllAt(valueFile_.Get(), key.data(), key.size(), offset);
+    return ReadValueAt(key.data(), key.size(), offset);
   }
 
   bool IsValidRowBlockHeader(const detail::RowBlockHeader& blockHeader) const {
@@ -1314,8 +1562,7 @@ class Database::Impl {
     const uint64_t columnOffset =
         blockOffset + sizeof(detail::RowBlockHeader) +
         static_cast<uint64_t>(blockHeader.bucketCount) * sizeof(detail::RowKeyBucket);
-    return detail::ReadAllAt(rowValueFiles_[shardId].Get(), column.data(),
-                             column.size(), columnOffset);
+    return ReadRowValueAt(shardId, column.data(), column.size(), columnOffset);
   }
 
   Status LoadRowBlock(const detail::RowIndexBucket& bucket,
@@ -1324,8 +1571,7 @@ class Database::Impl {
       return Status::Corruption("row index points to an invalid shard");
     }
     block.resize(static_cast<size_t>(bucket.blockSize));
-    return detail::ReadAllAt(rowValueFiles_[bucket.shardId].Get(), block.data(),
-                             block.size(), bucket.blockOffset);
+    return ReadRowValueAt(bucket.shardId, block.data(), block.size(), bucket.blockOffset);
   }
 
   Status DecodeRowBlockEntries(const std::vector<std::byte>& block,
@@ -1426,9 +1672,10 @@ class Database::Impl {
     return Status::Ok();
   }
 
-  Status BuildRowBlock(std::string_view column, uint64_t rowId,
-                       std::span<const RowStructEntry> entries, uint64_t sequence,
-                       uint64_t columnHash, std::vector<std::byte>& block) const {
+  Status BuildRowBlockLayout(std::string_view column, uint64_t rowId,
+                             std::span<const RowStructEntry> entries,
+                             uint64_t sequence, uint64_t columnHash,
+                             RowBlockLayout& layout) const {
     if (entries.size() > std::numeric_limits<uint32_t>::max()) {
       return Status::InvalidArgument("row entry count must fit in uint32");
     }
@@ -1440,32 +1687,32 @@ class Database::Impl {
       return Status::InvalidArgument("row key bucket count must fit in uint32");
     }
 
-    std::vector<detail::RowKeyBucket> keyBuckets(static_cast<size_t>(bucketCount));
-    std::vector<std::byte> keyBytes;
-    std::vector<std::byte> valueBytes;
+    layout.keyBuckets.assign(static_cast<size_t>(bucketCount), {});
+    layout.keyBytes.clear();
+    layout.valueEntries.clear();
+    layout.keyBytes.reserve(entries.size() * 16);
+    std::vector<size_t> selectedEntries(static_cast<size_t>(bucketCount), entries.size());
     uint32_t itemCount = 0;
 
-    for (const RowStructEntry& entry : entries) {
+    for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+      const RowStructEntry& entry = entries[entryIndex];
       const uint64_t keyHash = detail::HashString(entry.key);
       const uint64_t mask = bucketCount - 1;
       const uint64_t start = detail::MixHashes(keyHash, rowId) & mask;
       bool placed = false;
 
       for (uint64_t probe = 0; probe < bucketCount; ++probe) {
-        detail::RowKeyBucket& bucket = keyBuckets[(start + probe) & mask];
+        const uint64_t bucketIndex = (start + probe) & mask;
+        detail::RowKeyBucket& bucket = layout.keyBuckets[bucketIndex];
         if (bucket.state == detail::kBucketEmpty) {
-          const uint64_t keyOffset = keyBytes.size();
-          const uint64_t valueOffset = valueBytes.size();
-          AppendBytes(keyBytes, entry.key.data(), entry.key.size());
-          AppendBytes(valueBytes, entry.flatBufferBytes.data(),
-                      entry.flatBufferBytes.size());
+          const uint64_t keyOffset = layout.keyBytes.size();
+          AppendBytes(layout.keyBytes, entry.key.data(), entry.key.size());
 
           bucket.state = detail::kBucketFilled;
           bucket.keyHash = keyHash;
           bucket.keyOffset = keyOffset;
           bucket.keySize = entry.key.size();
-          bucket.valueOffset = valueOffset;
-          bucket.valueSize = entry.flatBufferBytes.size();
+          selectedEntries[bucketIndex] = entryIndex;
           ++itemCount;
           placed = true;
           break;
@@ -1475,16 +1722,13 @@ class Database::Impl {
           continue;
         }
         const auto* storedKey =
-            reinterpret_cast<const char*>(keyBytes.data() + bucket.keyOffset);
+            reinterpret_cast<const char*>(layout.keyBytes.data() + bucket.keyOffset);
         if (std::string_view(storedKey, static_cast<size_t>(bucket.keySize)) !=
             entry.key) {
           continue;
         }
 
-        const uint64_t valueOffset = valueBytes.size();
-        AppendBytes(valueBytes, entry.flatBufferBytes.data(), entry.flatBufferBytes.size());
-        bucket.valueOffset = valueOffset;
-        bucket.valueSize = entry.flatBufferBytes.size();
+        selectedEntries[bucketIndex] = entryIndex;
         placed = true;
         break;
       }
@@ -1494,86 +1738,100 @@ class Database::Impl {
       }
     }
 
-    detail::RowBlockHeader blockHeader;
-    blockHeader.sequence = sequence;
-    blockHeader.columnHash = columnHash;
-    blockHeader.rowId = rowId;
-    blockHeader.columnSize = static_cast<uint32_t>(column.size());
-    blockHeader.itemCount = itemCount;
-    blockHeader.bucketCount = static_cast<uint32_t>(bucketCount);
-    blockHeader.keyBytesSize = keyBytes.size();
-    blockHeader.valueBytesSize = valueBytes.size();
-    blockHeader.blockSize =
-        sizeof(detail::RowBlockHeader) + bucketCount * sizeof(detail::RowKeyBucket) +
-        column.size() + keyBytes.size() + valueBytes.size();
+    uint64_t valueBytesSize = 0;
+    layout.valueEntries.reserve(itemCount);
+    for (uint64_t bucketIndex = 0; bucketIndex < bucketCount; ++bucketIndex) {
+      detail::RowKeyBucket& bucket = layout.keyBuckets[bucketIndex];
+      if (bucket.state == detail::kBucketEmpty) {
+        continue;
+      }
 
-    block.clear();
-    block.reserve(static_cast<size_t>(blockHeader.blockSize));
-    AppendPod(block, blockHeader);
-    AppendBytes(block, keyBuckets.data(), keyBuckets.size() * sizeof(detail::RowKeyBucket));
-    AppendBytes(block, column.data(), column.size());
-    AppendBytes(block, keyBytes.data(), keyBytes.size());
-    AppendBytes(block, valueBytes.data(), valueBytes.size());
+      const RowStructEntry& entry = entries[selectedEntries[bucketIndex]];
+      bucket.valueOffset = valueBytesSize;
+      bucket.valueSize = entry.flatBufferBytes.size();
+      valueBytesSize += entry.flatBufferBytes.size();
+      layout.valueEntries.push_back(&entry);
+    }
+
+    layout.header = {};
+    layout.header.sequence = sequence;
+    layout.header.columnHash = columnHash;
+    layout.header.rowId = rowId;
+    layout.header.columnSize = static_cast<uint32_t>(column.size());
+    layout.header.itemCount = itemCount;
+    layout.header.bucketCount = static_cast<uint32_t>(bucketCount);
+    layout.header.keyBytesSize = layout.keyBytes.size();
+    layout.header.valueBytesSize = valueBytesSize;
+    layout.header.blockSize =
+        sizeof(detail::RowBlockHeader) + bucketCount * sizeof(detail::RowKeyBucket) +
+        column.size() + layout.keyBytes.size() + valueBytesSize;
     return Status::Ok();
   }
 
-  Status FindValueInRowBlock(const std::vector<std::byte>& block,
-                             std::string_view column, uint64_t rowId,
-                             std::string_view key,
-                             std::vector<std::byte>& flatBufferBytes) const {
-    if (block.size() < sizeof(detail::RowBlockHeader)) {
-      return Status::Corruption("row block is truncated");
+  Status FindValueInRowBlockAt(const detail::RowIndexBucket& rowBucket,
+                               const detail::RowBlockHeader& blockHeader,
+                               std::string_view key,
+                               std::vector<std::byte>& flatBufferBytes) const {
+    if (rowBucket.shardId >= rowValueFiles_.size()) {
+      return Status::Corruption("row index points to an invalid shard");
     }
-
-    const auto* header =
-        reinterpret_cast<const detail::RowBlockHeader*>(block.data());
-    if (!IsValidRowBlockHeader(*header) || header->blockSize != block.size() ||
-        header->rowId != rowId || header->columnHash != detail::HashString(column)) {
-      return Status::Corruption("row block header does not match requested row");
+    if (!IsValidRowBlockHeader(blockHeader) ||
+        blockHeader.blockSize != rowBucket.blockSize) {
+      return Status::Corruption("row index points to an invalid row block");
     }
 
     const uint64_t bucketsOffset = sizeof(detail::RowBlockHeader);
     const uint64_t columnOffset =
-        bucketsOffset + static_cast<uint64_t>(header->bucketCount) *
+        bucketsOffset + static_cast<uint64_t>(blockHeader.bucketCount) *
                             sizeof(detail::RowKeyBucket);
-    const uint64_t keyBytesOffset = columnOffset + header->columnSize;
-    const uint64_t valueBytesOffset = keyBytesOffset + header->keyBytesSize;
-
-    const auto* storedColumn =
-        reinterpret_cast<const char*>(block.data() + columnOffset);
-    if (std::string_view(storedColumn, header->columnSize) != column) {
-      return Status::Corruption("row block column does not match requested column");
-    }
-
-    const auto* keyBuckets =
-        reinterpret_cast<const detail::RowKeyBucket*>(block.data() + bucketsOffset);
+    const uint64_t keyBytesOffset = columnOffset + blockHeader.columnSize;
+    const uint64_t valueBytesOffset = keyBytesOffset + blockHeader.keyBytesSize;
     const uint64_t keyHash = detail::HashString(key);
-    const uint64_t mask = header->bucketCount - 1;
-    const uint64_t start = detail::MixHashes(keyHash, rowId) & mask;
+    const uint64_t mask = blockHeader.bucketCount - 1;
+    const uint64_t start = detail::MixHashes(keyHash, blockHeader.rowId) & mask;
 
-    for (uint64_t probe = 0; probe < header->bucketCount; ++probe) {
-      const detail::RowKeyBucket& bucket = keyBuckets[(start + probe) & mask];
+    for (uint64_t probe = 0; probe < blockHeader.bucketCount; ++probe) {
+      const uint64_t bucketIndex = (start + probe) & mask;
+      detail::RowKeyBucket bucket;
+      Status status = ReadRowValueAt(
+          rowBucket.shardId, &bucket, sizeof(bucket),
+          rowBucket.blockOffset + bucketsOffset +
+              bucketIndex * sizeof(detail::RowKeyBucket));
+      if (!status) {
+        return status;
+      }
       if (bucket.state == detail::kBucketEmpty) {
         return Status::NotFound("key not found in row");
+      }
+      if (bucket.state != detail::kBucketFilled) {
+        return Status::Corruption("row key bucket state is invalid");
       }
       if (bucket.keyHash != keyHash || bucket.keySize != key.size()) {
         continue;
       }
-      if (bucket.keyOffset + bucket.keySize > header->keyBytesSize ||
-          bucket.valueOffset + bucket.valueSize > header->valueBytesSize) {
+      if (bucket.keyOffset > blockHeader.keyBytesSize ||
+          bucket.keySize > blockHeader.keyBytesSize - bucket.keyOffset ||
+          bucket.valueOffset > blockHeader.valueBytesSize ||
+          bucket.valueSize > blockHeader.valueBytesSize - bucket.valueOffset) {
         return Status::Corruption("row key bucket points outside block");
       }
 
-      const auto* storedKey = reinterpret_cast<const char*>(
-          block.data() + keyBytesOffset + bucket.keyOffset);
-      if (std::string_view(storedKey, static_cast<size_t>(bucket.keySize)) != key) {
+      std::string storedKey(key.size(), '\0');
+      status = ReadRowValueAt(rowBucket.shardId, storedKey.data(), storedKey.size(),
+                              rowBucket.blockOffset + keyBytesOffset +
+                                  bucket.keyOffset);
+      if (!status) {
+        return status;
+      }
+      if (storedKey != key) {
         continue;
       }
 
-      const std::byte* valueBegin =
-          block.data() + valueBytesOffset + bucket.valueOffset;
-      flatBufferBytes.assign(valueBegin, valueBegin + bucket.valueSize);
-      return Status::Ok();
+      flatBufferBytes.resize(static_cast<size_t>(bucket.valueSize));
+      return ReadRowValueAt(rowBucket.shardId, flatBufferBytes.data(),
+                            flatBufferBytes.size(),
+                            rowBucket.blockOffset + valueBytesOffset +
+                                bucket.valueOffset);
     }
 
     return Status::NotFound("key not found in row");
@@ -1598,7 +1856,7 @@ class Database::Impl {
     oldBuckets.reserve(static_cast<size_t>(IndexHeader()->itemCount));
     for (uint64_t index = 0; index < IndexHeader()->bucketCount; ++index) {
       const detail::IndexBucket& bucket = Buckets()[index];
-      if (bucket.state == detail::kBucketFilled) {
+      if (bucket.hash != 0) {
         oldBuckets.push_back(bucket);
       }
     }
@@ -1623,16 +1881,31 @@ class Database::Impl {
   Status PlaceExistingBucket(const detail::IndexBucket& bucket) {
     const uint64_t bucketCount = IndexHeader()->bucketCount;
     const uint64_t mask = bucketCount - 1;
-    const uint64_t start = detail::MixHashes(bucket.columnHash, bucket.keyHash) & mask;
+    const uint64_t start = bucket.hash & mask;
 
     for (uint64_t probe = 0; probe < bucketCount; ++probe) {
       const uint64_t index = (start + probe) & mask;
-      if (Buckets()[index].state == detail::kBucketEmpty) {
+      if (Buckets()[index].hash == 0) {
         Buckets()[index] = bucket;
         return Status::Ok();
       }
     }
     return Status::Corruption("index table is full during resize");
+  }
+
+  Status PlaceNewBucket(const detail::IndexBucket& bucket) {
+    const uint64_t bucketCount = IndexHeader()->bucketCount;
+    const uint64_t mask = bucketCount - 1;
+    const uint64_t start = bucket.hash & mask;
+
+    for (uint64_t probe = 0; probe < bucketCount; ++probe) {
+      const uint64_t index = (start + probe) & mask;
+      if (Buckets()[index].hash == 0) {
+        Buckets()[index] = bucket;
+        return Status::Ok();
+      }
+    }
+    return Status::Corruption("index table is full during unique insert");
   }
 
   Status EnsureRowCapacityForInsert() {
@@ -1920,13 +2193,16 @@ class Database::Impl {
         }
 
         bool matches = false;
-        status = RowBlockMatches(bucket, column, rowId, matches);
+        detail::RowBlockHeader blockHeader;
+        status = RowBlockMatches(bucket, column, rowId, matches, &blockHeader);
         if (!status) {
           return status;
         }
         if (matches) {
           lookup.index = index;
           lookup.found = true;
+          lookup.bucket = bucket;
+          lookup.blockHeader = blockHeader;
           return Status::Ok();
         }
       }
@@ -1939,20 +2215,21 @@ class Database::Impl {
   }
 
   Status RowBlockMatches(const detail::RowIndexBucket& bucket, std::string_view column,
-                         uint64_t rowId, bool& matches) const {
+                         uint64_t rowId, bool& matches,
+                         detail::RowBlockHeader* matchingHeader = nullptr) const {
     matches = false;
     if (bucket.shardId >= rowValueFiles_.size()) {
       return Status::Corruption("row index points to an invalid shard");
     }
 
     detail::RowBlockHeader blockHeader;
-    Status status = detail::ReadAllAt(rowValueFiles_[bucket.shardId].Get(), &blockHeader,
-                                      sizeof(blockHeader), bucket.blockOffset);
+    Status status = ReadRowValueAt(bucket.shardId, &blockHeader, sizeof(blockHeader),
+                                   bucket.blockOffset);
     if (!status) {
       return status;
     }
-    if (!IsValidRowBlockHeader(blockHeader) || blockHeader.rowId != rowId ||
-        blockHeader.blockSize != bucket.blockSize) {
+    if (!IsValidRowBlockHeader(blockHeader) || blockHeader.columnHash != bucket.columnHash ||
+        blockHeader.rowId != rowId || blockHeader.blockSize != bucket.blockSize) {
       return Status::Corruption("row index points to an invalid row block");
     }
     if (blockHeader.columnSize != column.size()) {
@@ -1967,6 +2244,9 @@ class Database::Impl {
     }
 
     matches = storedColumn == column;
+    if (matches && matchingHeader != nullptr) {
+      *matchingHeader = blockHeader;
+    }
     return Status::Ok();
   }
 
@@ -1979,17 +2259,18 @@ class Database::Impl {
                     uint64_t keyHash, BucketLookup& lookup) const {
     const uint64_t bucketCount = IndexHeader()->bucketCount;
     const uint64_t mask = bucketCount - 1;
-    const uint64_t start = detail::MixHashes(columnHash, keyHash) & mask;
+    const uint64_t hash = ObjectIndexHash(columnHash, keyHash);
+    const uint64_t start = hash & mask;
 
     for (uint64_t probe = 0; probe < bucketCount; ++probe) {
       const uint64_t index = (start + probe) & mask;
       const detail::IndexBucket& bucket = Buckets()[index];
-      if (bucket.state == detail::kBucketEmpty) {
+      if (bucket.hash == 0) {
         lookup.index = index;
         lookup.found = false;
         return Status::Ok();
       }
-      if (bucket.columnHash != columnHash || bucket.keyHash != keyHash) {
+      if (bucket.hash != hash) {
         continue;
       }
 
@@ -2013,8 +2294,8 @@ class Database::Impl {
     matches = false;
 
     detail::ValueRecordHeader recordHeader;
-    Status status = detail::ReadAllAt(valueFile_.Get(), &recordHeader,
-                                      sizeof(recordHeader), bucket.recordOffset);
+    Status status = ReadValueAt(&recordHeader, sizeof(recordHeader),
+                                bucket.recordOffset);
     if (!status) {
       return status;
     }
@@ -2045,13 +2326,16 @@ class Database::Impl {
   detail::FileDescriptor valueFile_;
   detail::FileDescriptor indexFile_;
   detail::FileDescriptor rowIndexFile_;
+  detail::MappedFile valueMap_;
   detail::MappedFile indexMap_;
   detail::MappedFile rowIndexMap_;
   std::vector<detail::FileDescriptor> rowValueFiles_;
+  std::vector<detail::MappedFile> rowValueMaps_;
   std::vector<std::unique_ptr<std::atomic<uint64_t>>> rowAppendOffsets_;
   std::atomic<uint64_t> rowPendingInsertCount_{0};
   uint64_t appendOffset_ = 0;
   bool open_ = false;
+  bool readOnly_ = false;
 };
 
 Database::Database() : impl_(new Impl()) {}
@@ -2076,6 +2360,14 @@ Status Database::Open(const std::filesystem::path& directory,
     impl_ = new Impl();
   }
   return impl_->Open(directory, options);
+}
+
+Status Database::OpenReadOnly(const std::filesystem::path& directory,
+                              const DatabaseOptions& options) {
+  if (impl_ == nullptr) {
+    impl_ = new Impl();
+  }
+  return impl_->OpenReadOnly(directory, options);
 }
 
 Status Database::Close() {
@@ -2104,6 +2396,12 @@ Status Database::PutStructs(std::string_view column,
                             std::span<const StructEntry> entries) {
   return impl_ == nullptr ? Status::NotOpen("database is not open")
                           : impl_->PutStructs(column, entries);
+}
+
+Status Database::PutUniqueStructs(std::string_view column,
+                                  std::span<const StructEntry> entries) {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->PutUniqueStructs(column, entries);
 }
 
 Status Database::GetStruct(std::string_view column, std::string_view key,

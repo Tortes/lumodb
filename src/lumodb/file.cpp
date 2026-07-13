@@ -52,9 +52,10 @@ MappedFile::~MappedFile() {
 }
 
 MappedFile::MappedFile(MappedFile&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
+    : data_(other.data_), size_(other.size_), writable_(other.writable_) {
   other.data_ = nullptr;
   other.size_ = 0;
+  other.writable_ = false;
 }
 
 MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
@@ -62,30 +63,43 @@ MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
     Unmap();
     data_ = other.data_;
     size_ = other.size_;
+    writable_ = other.writable_;
     other.data_ = nullptr;
     other.size_ = 0;
+    other.writable_ = false;
   }
   return *this;
 }
 
 Status MappedFile::Map(int fd, uint64_t size) {
+  return MapWithProtection(fd, size, PROT_READ | PROT_WRITE);
+}
+
+Status MappedFile::MapReadOnly(int fd, uint64_t size) {
+  return MapWithProtection(fd, size, PROT_READ);
+}
+
+Status MappedFile::MapWithProtection(int fd, uint64_t size, int protection) {
   Unmap();
   if (size == 0) {
     return Status::InvalidArgument("cannot mmap an empty file");
   }
-  void* mapped =
-      mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  void* mapped = mmap(nullptr, static_cast<size_t>(size), protection, MAP_SHARED, fd, 0);
   if (mapped == MAP_FAILED) {
     return Status::IoError(ErrnoMessage("mmap"));
   }
   data_ = mapped;
   size_ = size;
+  writable_ = (protection & PROT_WRITE) != 0;
   return Status::Ok();
 }
 
 Status MappedFile::Sync() {
   if (data_ == nullptr) {
     return Status::Ok();
+  }
+  if (!writable_) {
+    return Status::InvalidArgument("cannot sync a read-only mapping");
   }
   if (msync(data_, static_cast<size_t>(size_), MS_SYNC) != 0) {
     return Status::IoError(ErrnoMessage("msync"));
@@ -99,6 +113,7 @@ void MappedFile::Unmap() {
   }
   data_ = nullptr;
   size_ = 0;
+  writable_ = false;
 }
 
 Status EnsureDirectory(const std::filesystem::path& directory) {
@@ -118,6 +133,15 @@ Status EnsureDirectory(const std::filesystem::path& directory) {
 
 Status OpenReadWriteCreate(const std::filesystem::path& path, FileDescriptor& fd) {
   int rawFd = open(path.c_str(), O_RDWR | O_CREAT, 0644);
+  if (rawFd < 0) {
+    return Status::IoError(ErrnoMessage("open " + path.string()));
+  }
+  fd.Reset(rawFd);
+  return Status::Ok();
+}
+
+Status OpenReadOnly(const std::filesystem::path& path, FileDescriptor& fd) {
+  int rawFd = open(path.c_str(), O_RDONLY);
   if (rawFd < 0) {
     return Status::IoError(ErrnoMessage("open " + path.string()));
   }

@@ -17,7 +17,7 @@ struct DatabaseOptions {
   uint64_t initialBucketCount = 1ULL << 16;
   uint64_t initialRowBucketCount = 1ULL << 16;
   uint32_t rowShardCount = 8;
-  double maxLoadFactor = 0.70;
+  double maxLoadFactor = 0.80;
 };
 
 struct RowStructEntry {
@@ -49,6 +49,8 @@ class Database {
 
   Status Open(const std::filesystem::path& directory,
               const DatabaseOptions& options = DatabaseOptions());
+  Status OpenReadOnly(const std::filesystem::path& directory,
+                      const DatabaseOptions& options = DatabaseOptions());
   Status Close();
   Status Flush();
 
@@ -58,6 +60,9 @@ class Database {
   Status PutStruct(std::string_view column, std::string_view key,
                    std::span<const std::byte> flatBufferBytes);
   Status PutStructs(std::string_view column, std::span<const StructEntry> entries);
+  // Every (column, key) must be new for the lifetime of the database.
+  Status PutUniqueStructs(std::string_view column,
+                          std::span<const StructEntry> entries);
   Status GetStruct(std::string_view column, std::string_view key,
                    std::vector<std::byte>& flatBufferBytes) const;
   Status PutRowStruct(std::string_view column, uint64_t rowId, std::string_view key,
