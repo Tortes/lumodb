@@ -135,6 +135,46 @@ void VerifyRowsInParallel(const LumoDB::Database& database, std::string_view col
   }
 }
 
+void VerifyObjectsInParallel(const LumoDB::Database& database, std::string_view column,
+                             uint64_t objectCount, uint32_t threadCount,
+                             ThreadFailures& failures) {
+  std::atomic<uint64_t> nextObject{0};
+  std::vector<std::thread> readers;
+  readers.reserve(threadCount);
+
+  for (uint32_t threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+    readers.emplace_back([&]() {
+      for (;;) {
+        const uint64_t objectIndex =
+            nextObject.fetch_add(1, std::memory_order_relaxed);
+        if (objectIndex >= objectCount) {
+          return;
+        }
+
+        std::vector<std::byte> value;
+        LumoDB::Status status =
+            database.GetStruct(column, ObjectKey(objectIndex), value);
+        if (!status) {
+          failures.Add("read object " + std::to_string(objectIndex) +
+                       " failed: " + status.Message());
+          continue;
+        }
+
+        const std::string actual = LumoDB::test::BytesToString(value);
+        const std::string expected = ObjectValue(column, objectIndex);
+        if (actual != expected) {
+          failures.Add("read object " + std::to_string(objectIndex) +
+                       " expected " + expected + " got " + actual);
+        }
+      }
+    });
+  }
+
+  for (std::thread& reader : readers) {
+    reader.join();
+  }
+}
+
 TEST(LumoDBSystemTest, WritesReadsObjectPayloadsAndReopens) {
   const std::filesystem::path directory =
       LumoDB::test::MakeTestDirectory("st-object-write-read");
@@ -329,6 +369,83 @@ TEST(LumoDBSystemTest, WritesSameColumnRowsInParallelAndReadsRowsInParallel) {
   VerifyRowsInParallel(database, "StructA", kRowCount, kEntryCount, kReaderCount,
                        reopenReadFailures);
   EXPECT_TRUE(reopenReadFailures.Empty()) << reopenReadFailures.Report();
+  ASSERT_OK(database.Close());
+}
+
+TEST(LumoDBSystemTest, UsesImmutableWriteAndReadOnlyWorkflow) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("st-best-performance-workflow");
+
+  constexpr uint64_t kObjectCount = 192;
+  constexpr uint64_t kRowCount = 96;
+  constexpr uint64_t kRowEntryCount = 12;
+  constexpr uint32_t kWriterCount = 4;
+  constexpr uint32_t kReaderCount = 4;
+
+  LumoDB::DatabaseOptions options;
+  options.initialBucketCount = 256;
+  options.initialRowBucketCount = 128;
+  options.rowShardCount = kWriterCount;
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  std::vector<std::string> objectKeys;
+  std::vector<std::vector<std::byte>> objectValues;
+  std::vector<LumoDB::StructEntry> objectEntries;
+  objectKeys.reserve(kObjectCount);
+  objectValues.reserve(kObjectCount);
+  objectEntries.reserve(kObjectCount);
+  for (uint64_t objectIndex = 0; objectIndex < kObjectCount; ++objectIndex) {
+    objectKeys.push_back(ObjectKey(objectIndex));
+    objectValues.push_back(
+        LumoDB::test::MakeBytes(ObjectValue("FlatColumn", objectIndex)));
+    objectEntries.push_back({.key = objectKeys.back(),
+                             .flatBufferBytes = objectValues.back()});
+  }
+  ASSERT_OK(database.PutUniqueStructs("FlatColumn", objectEntries));
+
+  std::atomic<uint64_t> nextRow{0};
+  ThreadFailures writeFailures;
+  std::vector<std::thread> writers;
+  writers.reserve(kWriterCount);
+  for (uint32_t writerIndex = 0; writerIndex < kWriterCount; ++writerIndex) {
+    writers.emplace_back([&]() {
+      for (;;) {
+        const uint64_t rowId = nextRow.fetch_add(1, std::memory_order_relaxed);
+        if (rowId >= kRowCount) {
+          return;
+        }
+
+        RowPayload payload = BuildRowPayload(rowId, kRowEntryCount);
+        LumoDB::Status status =
+            database.PutRowStructs("RowColumn", rowId, payload.entries);
+        if (!status) {
+          writeFailures.Add("write row " + std::to_string(rowId) +
+                            " failed: " + status.Message());
+        }
+      }
+    });
+  }
+  for (std::thread& writer : writers) {
+    writer.join();
+  }
+  ASSERT_TRUE(writeFailures.Empty()) << writeFailures.Report();
+  EXPECT_EQ(database.EntryCount(), kObjectCount);
+  EXPECT_EQ(database.RowCount(), kRowCount);
+
+  ASSERT_OK(database.Close());
+  ASSERT_OK(database.OpenReadOnly(directory, options));
+
+  ThreadFailures objectReadFailures;
+  VerifyObjectsInParallel(database, "FlatColumn", kObjectCount, kReaderCount,
+                          objectReadFailures);
+  EXPECT_TRUE(objectReadFailures.Empty()) << objectReadFailures.Report();
+
+  ThreadFailures rowReadFailures;
+  VerifyRowsInParallel(database, "RowColumn", kRowCount, kRowEntryCount,
+                       kReaderCount, rowReadFailures);
+  EXPECT_TRUE(rowReadFailures.Empty()) << rowReadFailures.Report();
   ASSERT_OK(database.Close());
 }
 
