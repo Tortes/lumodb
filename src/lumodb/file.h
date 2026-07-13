@@ -3,10 +3,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <span>
 
 #include "lumodb/status.h"
 
 namespace LumoDB::detail {
+
+struct WriteSlice {
+  const void* data = nullptr;
+  size_t size = 0;
+};
 
 class FileDescriptor {
  public:
@@ -61,5 +67,6 @@ Status TruncateFile(int fd, uint64_t size);
 Status SyncFile(int fd);
 Status ReadAllAt(int fd, void* data, size_t size, uint64_t offset);
 Status WriteAllAt(int fd, const void* data, size_t size, uint64_t offset);
+Status WriteVAllAt(int fd, std::span<const WriteSlice> slices, uint64_t offset);
 
 }  // namespace LumoDB::detail

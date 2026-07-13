@@ -29,6 +29,7 @@ struct BenchmarkOptions {
   std::vector<double> sizesGb = {1.0, 5.0, 10.0};
   BenchmarkMode mode = BenchmarkMode::kObject;
   uint64_t payloadSize = 4096;
+  uint64_t objectBatchSize = 1;
   uint64_t rowEntries = 64;
   uint64_t readCount = 100;
   uint32_t threads = std::max<uint32_t>(1, std::thread::hardware_concurrency());
@@ -85,6 +86,8 @@ BenchmarkOptions ParseArgs(int argc, char** argv) {
       options.mode = ParseMode(nextValue());
     } else if (arg == "--payload-size") {
       options.payloadSize = std::stoull(std::string(nextValue()));
+    } else if (arg == "--object-batch-size") {
+      options.objectBatchSize = std::stoull(std::string(nextValue()));
     } else if (arg == "--row-entries") {
       options.rowEntries = std::stoull(std::string(nextValue()));
     } else if (arg == "--read-count") {
@@ -100,8 +103,9 @@ BenchmarkOptions ParseArgs(int argc, char** argv) {
       std::exit(EXIT_FAILURE);
     }
   }
-  if (options.rowEntries == 0 || options.threads == 0 || options.shards == 0) {
-    std::cerr << "row-entries, threads, and shards must be greater than zero\n";
+  if (options.objectBatchSize == 0 || options.rowEntries == 0 || options.threads == 0 ||
+      options.shards == 0) {
+    std::cerr << "object-batch-size, row-entries, threads, and shards must be greater than zero\n";
     std::exit(EXIT_FAILURE);
   }
   return options;
@@ -192,17 +196,42 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
     std::exit(EXIT_FAILURE);
   }
 
-  std::vector<std::byte> payload = MakeFlatBufferPayload(options.payloadSize, 1);
+  std::chrono::steady_clock::duration prepareDuration{};
+  std::chrono::steady_clock::duration databaseWriteDuration{};
   auto writeStart = std::chrono::steady_clock::now();
-  for (uint64_t index = 0; index < objectCount; ++index) {
-    payload = MakeFlatBufferPayload(options.payloadSize, index);
-    status = database.PutStruct("StructA", KeyForIndex(index), payload);
+  for (uint64_t firstObject = 0; firstObject < objectCount;
+       firstObject += options.objectBatchSize) {
+    const uint64_t batchCount =
+        std::min<uint64_t>(options.objectBatchSize, objectCount - firstObject);
+    const auto prepareStart = std::chrono::steady_clock::now();
+    std::vector<std::string> keys;
+    std::vector<std::vector<std::byte>> payloads;
+    std::vector<LumoDB::StructEntry> entries;
+    keys.reserve(static_cast<size_t>(batchCount));
+    payloads.reserve(static_cast<size_t>(batchCount));
+    entries.reserve(static_cast<size_t>(batchCount));
+    for (uint64_t offset = 0; offset < batchCount; ++offset) {
+      const uint64_t objectIndex = firstObject + offset;
+      keys.push_back(KeyForIndex(objectIndex));
+      payloads.push_back(MakeFlatBufferPayload(options.payloadSize, objectIndex));
+      entries.push_back({.key = keys.back(), .flatBufferBytes = payloads.back()});
+    }
+    const auto prepareEnd = std::chrono::steady_clock::now();
+    prepareDuration += prepareEnd - prepareStart;
+
+    const auto databaseWriteStart = std::chrono::steady_clock::now();
+    status = database.PutStructs("StructA", entries);
+    const auto databaseWriteEnd = std::chrono::steady_clock::now();
+    databaseWriteDuration += databaseWriteEnd - databaseWriteStart;
     if (!status) {
       std::cerr << "write failed: " << status.Message() << '\n';
       std::exit(EXIT_FAILURE);
     }
   }
+  const auto flushStart = std::chrono::steady_clock::now();
   status = database.Flush();
+  const auto flushEnd = std::chrono::steady_clock::now();
+  databaseWriteDuration += flushEnd - flushStart;
   if (!status) {
     std::cerr << "flush failed: " << status.Message() << '\n';
     std::exit(EXIT_FAILURE);
@@ -227,9 +256,13 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
   }
 
   std::cout << "mode=object size_gb=" << sizeGb << " objects=" << objectCount
+            << " batch_size=" << options.objectBatchSize
             << " payload=" << options.payloadSize << " bytes"
             << " write=" << FormatSeconds(writeEnd - writeStart)
             << " throughput=" << FormatMbPerSecond(writtenBytes, writeEnd - writeStart)
+            << " prepare=" << FormatSeconds(prepareDuration)
+            << " db_write=" << FormatSeconds(databaseWriteDuration)
+            << " db_throughput=" << FormatMbPerSecond(writtenBytes, databaseWriteDuration)
             << " read_count=" << options.readCount;
   PrintReadPercentiles(readDurations);
 
@@ -271,6 +304,8 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
   }
 
   std::atomic<uint64_t> nextRow{0};
+  std::atomic<uint64_t> prepareNanos{0};
+  std::atomic<uint64_t> databaseWriteNanos{0};
   std::mutex errorMutex;
   std::string errorMessage;
 
@@ -292,6 +327,7 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
         std::vector<std::string> keys;
         std::vector<std::vector<std::byte>> payloads;
         std::vector<LumoDB::RowStructEntry> entries;
+        const auto prepareStart = std::chrono::steady_clock::now();
         keys.reserve(static_cast<size_t>(rowObjectCount));
         payloads.reserve(static_cast<size_t>(rowObjectCount));
         entries.reserve(static_cast<size_t>(rowObjectCount));
@@ -302,8 +338,21 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
           payloads.push_back(MakeFlatBufferPayload(options.payloadSize, objectIndex));
           entries.push_back({.key = keys.back(), .flatBufferBytes = payloads.back()});
         }
+        const auto prepareEnd = std::chrono::steady_clock::now();
+        prepareNanos.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(prepareEnd - prepareStart)
+                    .count()),
+            std::memory_order_relaxed);
 
+        const auto databaseWriteStart = std::chrono::steady_clock::now();
         LumoDB::Status rowStatus = database.PutRowStructs("StructA", rowId, entries);
+        const auto databaseWriteEnd = std::chrono::steady_clock::now();
+        databaseWriteNanos.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      databaseWriteEnd - databaseWriteStart)
+                                      .count()),
+            std::memory_order_relaxed);
         if (!rowStatus) {
           std::lock_guard<std::mutex> lock(errorMutex);
           if (errorMessage.empty()) {
@@ -324,12 +373,19 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
     std::exit(EXIT_FAILURE);
   }
 
+  const auto flushStart = std::chrono::steady_clock::now();
   status = database.Flush();
+  const auto flushEnd = std::chrono::steady_clock::now();
   if (!status) {
     std::cerr << "flush failed: " << status.Message() << '\n';
     std::exit(EXIT_FAILURE);
   }
   auto writeEnd = std::chrono::steady_clock::now();
+  const auto prepareDuration = std::chrono::nanoseconds(prepareNanos.load(
+      std::memory_order_relaxed));
+  const auto databaseWriteDuration =
+      std::chrono::nanoseconds(databaseWriteNanos.load(std::memory_order_relaxed)) +
+      (flushEnd - flushStart);
 
   std::mt19937_64 random(42);
   std::vector<std::chrono::steady_clock::duration> readDurations;
@@ -355,6 +411,8 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
             << " payload=" << options.payloadSize << " bytes"
             << " write=" << FormatSeconds(writeEnd - writeStart)
             << " throughput=" << FormatMbPerSecond(writtenBytes, writeEnd - writeStart)
+            << " prepare_sum=" << FormatSeconds(prepareDuration)
+            << " db_write_sum=" << FormatSeconds(databaseWriteDuration)
             << " read_count=" << options.readCount;
   PrintReadPercentiles(readDurations);
 

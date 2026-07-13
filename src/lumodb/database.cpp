@@ -6,7 +6,9 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -40,6 +42,58 @@ bool FitsUint32(size_t value) {
 
 std::span<const std::byte> AsBytes(std::string_view value) {
   return {reinterpret_cast<const std::byte*>(value.data()), value.size()};
+}
+
+std::string EscapeText(std::string_view value) {
+  constexpr char kHexDigits[] = "0123456789abcdef";
+
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  escaped.push_back('"');
+  for (const unsigned char character : value) {
+    switch (character) {
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        if (character >= 0x20 && character <= 0x7e) {
+          escaped.push_back(static_cast<char>(character));
+        } else {
+          escaped += "\\x";
+          escaped.push_back(kHexDigits[character >> 4]);
+          escaped.push_back(kHexDigits[character & 0x0f]);
+        }
+        break;
+    }
+  }
+  escaped.push_back('"');
+  return escaped;
+}
+
+std::string HexBytes(std::span<const std::byte> bytes) {
+  constexpr char kHexDigits[] = "0123456789abcdef";
+
+  std::string text;
+  text.reserve(2 + bytes.size() * 2);
+  text += "0x";
+  for (const std::byte byte : bytes) {
+    const unsigned char value = static_cast<unsigned char>(byte);
+    text.push_back(kHexDigits[value >> 4]);
+    text.push_back(kHexDigits[value & 0x0f]);
+  }
+  return text;
 }
 
 template <typename T>
@@ -190,80 +244,104 @@ class Database::Impl {
 
   Status PutStruct(std::string_view column, std::string_view key,
                    std::span<const std::byte> flatBufferBytes) {
+    const std::array<StructEntry, 1> entries = {
+        StructEntry{.key = key, .flatBufferBytes = flatBufferBytes},
+    };
+    return PutStructs(column, entries);
+  }
+
+  Status PutStructs(std::string_view column, std::span<const StructEntry> entries) {
     if (!open_) {
       return Status::NotOpen("database is not open");
     }
-    if (!FitsUint32(column.size()) || !FitsUint32(key.size())) {
-      return Status::InvalidArgument("column and key must fit in uint32 length");
+    if (!FitsUint32(column.size())) {
+      return Status::InvalidArgument("column must fit in uint32 length");
+    }
+    if (entries.empty()) {
+      return Status::Ok();
+    }
+    for (const StructEntry& entry : entries) {
+      if (!FitsUint32(entry.key.size())) {
+        return Status::InvalidArgument("key must fit in uint32 length");
+      }
     }
 
-    Status status = EnsureCapacityForInsert();
+    Status status = EnsureCapacityForInsert(entries.size());
     if (!status) {
       return status;
     }
+
+    struct PendingRecord {
+      detail::ValueRecordHeader header;
+      std::string_view key;
+      std::span<const std::byte> value;
+      uint64_t recordOffset = 0;
+      uint64_t valueOffset = 0;
+      uint64_t recordSize = 0;
+    };
 
     const uint64_t columnHash = detail::HashString(column);
-    const uint64_t keyHash = detail::HashString(key);
+    uint64_t nextSequence = IndexHeader()->nextSequence;
+    uint64_t nextAppendOffset = appendOffset_;
+    std::vector<PendingRecord> pending;
+    pending.reserve(entries.size());
+    std::vector<detail::WriteSlice> recordSlices;
+    recordSlices.reserve(entries.size() * 4);
 
-    BucketLookup lookup;
-    status = FindBucket(column, key, columnHash, keyHash, lookup);
+    for (const StructEntry& entry : entries) {
+      PendingRecord& record = pending.emplace_back();
+      record.key = entry.key;
+      record.value = entry.flatBufferBytes;
+      record.recordOffset = nextAppendOffset;
+      record.valueOffset =
+          record.recordOffset + sizeof(detail::ValueRecordHeader) + column.size() +
+          entry.key.size();
+      record.recordSize = sizeof(detail::ValueRecordHeader) + column.size() +
+                          entry.key.size() + entry.flatBufferBytes.size();
+      record.header.sequence = nextSequence++;
+      record.header.columnHash = columnHash;
+      record.header.keyHash = detail::HashString(entry.key);
+      record.header.columnSize = static_cast<uint32_t>(column.size());
+      record.header.keySize = static_cast<uint32_t>(entry.key.size());
+      record.header.valueSize = entry.flatBufferBytes.size();
+
+      recordSlices.push_back({.data = &record.header, .size = sizeof(record.header)});
+      recordSlices.push_back({.data = column.data(), .size = column.size()});
+      recordSlices.push_back({.data = entry.key.data(), .size = entry.key.size()});
+      recordSlices.push_back(
+          {.data = entry.flatBufferBytes.data(), .size = entry.flatBufferBytes.size()});
+      nextAppendOffset += record.recordSize;
+    }
+
+    status = detail::WriteVAllAt(valueFile_.Get(), recordSlices, appendOffset_);
     if (!status) {
       return status;
     }
 
-    const uint64_t sequence = IndexHeader()->nextSequence;
-    const uint64_t recordOffset = appendOffset_;
-    const uint64_t valueOffset =
-        recordOffset + sizeof(detail::ValueRecordHeader) + column.size() + key.size();
-    const uint64_t recordSize =
-        sizeof(detail::ValueRecordHeader) + column.size() + key.size() +
-        flatBufferBytes.size();
+    for (const PendingRecord& record : pending) {
+      BucketLookup lookup;
+      status = FindBucket(column, record.key, columnHash, record.header.keyHash, lookup);
+      if (!status) {
+        return status;
+      }
 
-    detail::ValueRecordHeader recordHeader;
-    recordHeader.sequence = sequence;
-    recordHeader.columnHash = columnHash;
-    recordHeader.keyHash = keyHash;
-    recordHeader.columnSize = static_cast<uint32_t>(column.size());
-    recordHeader.keySize = static_cast<uint32_t>(key.size());
-    recordHeader.valueSize = flatBufferBytes.size();
+      detail::IndexBucket bucket;
+      bucket.state = detail::kBucketFilled;
+      bucket.columnHash = columnHash;
+      bucket.keyHash = record.header.keyHash;
+      bucket.recordOffset = record.recordOffset;
+      bucket.valueOffset = record.valueOffset;
+      bucket.valueSize = record.value.size();
+      bucket.recordSize = record.recordSize;
+      bucket.sequence = record.header.sequence;
 
-    status = detail::WriteAllAt(valueFile_.Get(), &recordHeader, sizeof(recordHeader),
-                                recordOffset);
-    if (!status) {
-      return status;
+      Buckets()[lookup.index] = bucket;
+      if (!lookup.found) {
+        ++IndexHeader()->itemCount;
+      }
     }
-    status = detail::WriteAllAt(valueFile_.Get(), column.data(), column.size(),
-                                recordOffset + sizeof(recordHeader));
-    if (!status) {
-      return status;
-    }
-    status = detail::WriteAllAt(valueFile_.Get(), key.data(), key.size(),
-                                recordOffset + sizeof(recordHeader) + column.size());
-    if (!status) {
-      return status;
-    }
-    status = detail::WriteAllAt(valueFile_.Get(), flatBufferBytes.data(),
-                                flatBufferBytes.size(), valueOffset);
-    if (!status) {
-      return status;
-    }
-
-    detail::IndexBucket bucket;
-    bucket.state = detail::kBucketFilled;
-    bucket.columnHash = columnHash;
-    bucket.keyHash = keyHash;
-    bucket.recordOffset = recordOffset;
-    bucket.valueOffset = valueOffset;
-    bucket.valueSize = flatBufferBytes.size();
-    bucket.recordSize = recordSize;
-    bucket.sequence = sequence;
-
-    Buckets()[lookup.index] = bucket;
-    if (!lookup.found) {
-      ++IndexHeader()->itemCount;
-    }
-    IndexHeader()->nextSequence = sequence + 1;
-    appendOffset_ += recordSize;
+    IndexHeader()->nextSequence = nextSequence;
+    appendOffset_ = nextAppendOffset;
     return Status::Ok();
   }
 
@@ -454,6 +532,229 @@ class Database::Impl {
     }
 
     values = std::move(result);
+    return Status::Ok();
+  }
+
+  Status GetColumnStats(std::vector<ColumnStats>& stats) const {
+    if (!open_) {
+      return Status::NotOpen("database is not open");
+    }
+
+    std::map<std::string, ColumnStats> columns;
+    for (uint64_t index = 0; index < IndexHeader()->bucketCount; ++index) {
+      const detail::IndexBucket& bucket = Buckets()[index];
+      if (bucket.state == detail::kBucketEmpty) {
+        continue;
+      }
+      if (bucket.state != detail::kBucketFilled) {
+        return Status::Corruption("object index bucket state is invalid");
+      }
+
+      detail::ValueRecordHeader recordHeader;
+      Status status = detail::ReadAllAt(valueFile_.Get(), &recordHeader,
+                                        sizeof(recordHeader), bucket.recordOffset);
+      if (!status) {
+        return status;
+      }
+      if (!IsValidRecordHeader(recordHeader)) {
+        return Status::Corruption("object index points to an invalid value record");
+      }
+
+      std::string column;
+      std::string key;
+      status = ReadRecordColumnKey(bucket.recordOffset, recordHeader, column, key);
+      if (!status) {
+        return status;
+      }
+      ColumnStats& columnStats = columns[column];
+      columnStats.column = column;
+      ++columnStats.objectCount;
+    }
+
+    for (uint64_t index = 0; index < RowIndexHeader()->bucketCount; ++index) {
+      detail::RowIndexBucket bucket;
+      Status status = LoadFilledRowBucketSnapshotIfPresent(index, bucket);
+      if (!status) {
+        return status;
+      }
+      if (bucket.state != detail::kRowBucketFilled) {
+        continue;
+      }
+      if (bucket.shardId >= rowValueFiles_.size()) {
+        return Status::Corruption("row index points to an invalid shard");
+      }
+
+      detail::RowBlockHeader blockHeader;
+      status = detail::ReadAllAt(rowValueFiles_[bucket.shardId].Get(), &blockHeader,
+                                 sizeof(blockHeader), bucket.blockOffset);
+      if (!status) {
+        return status;
+      }
+      if (!IsValidRowBlockHeader(blockHeader) || blockHeader.blockSize != bucket.blockSize ||
+          blockHeader.columnHash != bucket.columnHash || blockHeader.rowId != bucket.rowId) {
+        return Status::Corruption("row index points to an invalid row block");
+      }
+
+      std::string column;
+      status = ReadRowBlockColumn(bucket.shardId, bucket.blockOffset, blockHeader, column);
+      if (!status) {
+        return status;
+      }
+      ColumnStats& columnStats = columns[column];
+      columnStats.column = column;
+      columnStats.objectCount += blockHeader.itemCount;
+      ++columnStats.rowCount;
+    }
+
+    stats.clear();
+    stats.reserve(columns.size());
+    for (auto& [column, columnStats] : columns) {
+      stats.push_back(std::move(columnStats));
+    }
+    return Status::Ok();
+  }
+
+  Status DumpColumnStats(std::ostream& output) const {
+    std::vector<ColumnStats> stats;
+    Status status = GetColumnStats(stats);
+    if (!status) {
+      return status;
+    }
+
+    output << "LumoDB column statistics\n";
+    for (const ColumnStats& columnStats : stats) {
+      output << "column=" << EscapeText(columnStats.column)
+             << " objects=" << columnStats.objectCount
+             << " rows=" << columnStats.rowCount << '\n';
+    }
+    return Status::Ok();
+  }
+
+  Status Dump(std::ostream& output) const {
+    if (!open_) {
+      return Status::NotOpen("database is not open");
+    }
+
+    output << "LumoDB dump\n";
+    output << "object_index: entries=" << EntryCount()
+           << " buckets=" << BucketCount()
+           << " next_sequence=" << IndexHeader()->nextSequence << '\n';
+    output << "objects:\n";
+    for (uint64_t index = 0; index < IndexHeader()->bucketCount; ++index) {
+      const detail::IndexBucket& bucket = Buckets()[index];
+      if (bucket.state == detail::kBucketEmpty) {
+        continue;
+      }
+      if (bucket.state != detail::kBucketFilled) {
+        return Status::Corruption("object index bucket state is invalid");
+      }
+
+      detail::ValueRecordHeader recordHeader;
+      Status status = detail::ReadAllAt(valueFile_.Get(), &recordHeader,
+                                        sizeof(recordHeader), bucket.recordOffset);
+      if (!status) {
+        return status;
+      }
+      if (!IsValidRecordHeader(recordHeader)) {
+        return Status::Corruption("object index points to an invalid value record");
+      }
+
+      std::string column;
+      std::string key;
+      status = ReadRecordColumnKey(bucket.recordOffset, recordHeader, column, key);
+      if (!status) {
+        return status;
+      }
+      std::vector<std::byte> value(static_cast<size_t>(bucket.valueSize));
+      status = detail::ReadAllAt(valueFile_.Get(), value.data(), value.size(),
+                                 bucket.valueOffset);
+      if (!status) {
+        return status;
+      }
+
+      output << "  object bucket=" << index
+             << " column=" << EscapeText(column)
+             << " key=" << EscapeText(key)
+             << " sequence=" << bucket.sequence
+             << " column_hash=" << bucket.columnHash
+             << " key_hash=" << bucket.keyHash
+             << " record_offset=" << bucket.recordOffset
+             << " value_offset=" << bucket.valueOffset
+             << " value_size=" << bucket.valueSize
+             << " record_size=" << bucket.recordSize
+             << " value_hex=" << HexBytes(value) << '\n';
+    }
+
+    output << "row_index: rows=" << RowCount()
+           << " buckets=" << RowBucketCount()
+           << " shards=" << rowValueFiles_.size()
+           << " next_sequence="
+           << AtomicLoad(RowIndexHeader()->nextSequence, std::memory_order_acquire) << '\n';
+    output << "rows:\n";
+    for (uint64_t index = 0; index < RowIndexHeader()->bucketCount; ++index) {
+      detail::RowIndexBucket bucket;
+      Status status = LoadFilledRowBucketSnapshotIfPresent(index, bucket);
+      if (!status) {
+        return status;
+      }
+      if (bucket.state != detail::kRowBucketFilled) {
+        continue;
+      }
+
+      std::vector<std::byte> block;
+      status = LoadRowBlock(bucket, block);
+      if (!status) {
+        return status;
+      }
+      if (block.size() < sizeof(detail::RowBlockHeader)) {
+        return Status::Corruption("row block is truncated");
+      }
+      const auto* blockHeader =
+          reinterpret_cast<const detail::RowBlockHeader*>(block.data());
+      if (!IsValidRowBlockHeader(*blockHeader) || blockHeader->blockSize != block.size() ||
+          blockHeader->columnHash != bucket.columnHash || blockHeader->rowId != bucket.rowId) {
+        return Status::Corruption("row index points to an invalid row block");
+      }
+
+      const uint64_t columnOffset =
+          sizeof(detail::RowBlockHeader) +
+          static_cast<uint64_t>(blockHeader->bucketCount) * sizeof(detail::RowKeyBucket);
+      const auto* columnData = reinterpret_cast<const char*>(block.data() + columnOffset);
+      const std::string column(columnData, blockHeader->columnSize);
+      std::vector<std::string> keys;
+      std::vector<std::vector<std::byte>> values;
+      status = DecodeRowBlockEntries(block, column, bucket.rowId, keys, values);
+      if (!status) {
+        return status;
+      }
+
+      output << "  row bucket=" << index
+             << " column=" << EscapeText(column)
+             << " row_id=" << bucket.rowId
+             << " sequence=" << bucket.sequence
+             << " column_hash=" << bucket.columnHash
+             << " shard=" << bucket.shardId
+             << " block_offset=" << bucket.blockOffset
+             << " block_size=" << bucket.blockSize
+             << " object_count=" << blockHeader->itemCount << '\n';
+      for (size_t entry = 0; entry < keys.size(); ++entry) {
+        output << "    key=" << EscapeText(keys[entry])
+               << " value_size=" << values[entry].size()
+               << " value_hex=" << HexBytes(values[entry]) << '\n';
+      }
+    }
+
+    output << "column_statistics:\n";
+    std::vector<ColumnStats> stats;
+    Status status = GetColumnStats(stats);
+    if (!status) {
+      return status;
+    }
+    for (const ColumnStats& columnStats : stats) {
+      output << "  column=" << EscapeText(columnStats.column)
+             << " objects=" << columnStats.objectCount
+             << " rows=" << columnStats.rowCount << '\n';
+    }
     return Status::Ok();
   }
 
@@ -1278,15 +1579,18 @@ class Database::Impl {
     return Status::NotFound("key not found in row");
   }
 
-  Status EnsureCapacityForInsert() {
+  Status EnsureCapacityForInsert(uint64_t insertCount = 1) {
     const detail::IndexFileHeader* header = IndexHeader();
-    const double loadAfterInsert =
-        static_cast<double>(header->itemCount + 1) /
-        static_cast<double>(header->bucketCount);
-    if (loadAfterInsert <= options_.maxLoadFactor) {
+    uint64_t bucketCount = header->bucketCount;
+    while (static_cast<double>(header->itemCount + insertCount) /
+               static_cast<double>(bucketCount) >
+           options_.maxLoadFactor) {
+      bucketCount *= 2;
+    }
+    if (bucketCount == header->bucketCount) {
       return Status::Ok();
     }
-    return ResizeIndex(header->bucketCount * 2);
+    return ResizeIndex(bucketCount);
   }
 
   Status ResizeIndex(uint64_t newBucketCount) {
@@ -1480,6 +1784,25 @@ class Database::Impl {
       }
       if (snapshotState == RowBucketSnapshotState::kEmpty) {
         return Status::Corruption("row index bucket is empty");
+      }
+      std::this_thread::yield();
+    }
+  }
+
+  Status LoadFilledRowBucketSnapshotIfPresent(uint64_t index,
+                                              detail::RowIndexBucket& snapshot) const {
+    for (;;) {
+      RowBucketSnapshotState snapshotState = RowBucketSnapshotState::kEmpty;
+      Status status = LoadRowBucketSnapshot(index, snapshot, snapshotState);
+      if (!status) {
+        return status;
+      }
+      if (snapshotState == RowBucketSnapshotState::kFilled) {
+        return Status::Ok();
+      }
+      if (snapshotState == RowBucketSnapshotState::kEmpty) {
+        snapshot = {};
+        return Status::Ok();
       }
       std::this_thread::yield();
     }
@@ -1777,6 +2100,12 @@ Status Database::PutStruct(std::string_view column, std::string_view key,
                           : impl_->PutStruct(column, key, flatBufferBytes);
 }
 
+Status Database::PutStructs(std::string_view column,
+                            std::span<const StructEntry> entries) {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->PutStructs(column, entries);
+}
+
 Status Database::GetStruct(std::string_view column, std::string_view key,
                            std::vector<std::byte>& flatBufferBytes) const {
   return impl_ == nullptr ? Status::NotOpen("database is not open")
@@ -1807,6 +2136,21 @@ Status Database::GetMany(std::string_view column, const std::vector<std::string>
                          std::vector<std::vector<std::byte>>& values) const {
   return impl_ == nullptr ? Status::NotOpen("database is not open")
                           : impl_->GetMany(column, keys, values);
+}
+
+Status Database::GetColumnStats(std::vector<ColumnStats>& stats) const {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->GetColumnStats(stats);
+}
+
+Status Database::DumpColumnStats(std::ostream& output) const {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->DumpColumnStats(output);
+}
+
+Status Database::Dump(std::ostream& output) const {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->Dump(output);
 }
 
 bool Database::IsOpen() const {

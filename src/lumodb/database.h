@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <iosfwd>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,6 +23,17 @@ struct DatabaseOptions {
 struct RowStructEntry {
   std::string_view key;
   std::span<const std::byte> flatBufferBytes;
+};
+
+struct StructEntry {
+  std::string_view key;
+  std::span<const std::byte> flatBufferBytes;
+};
+
+struct ColumnStats {
+  std::string column;
+  uint64_t objectCount = 0;
+  uint64_t rowCount = 0;
 };
 
 class Database {
@@ -45,6 +57,7 @@ class Database {
 
   Status PutStruct(std::string_view column, std::string_view key,
                    std::span<const std::byte> flatBufferBytes);
+  Status PutStructs(std::string_view column, std::span<const StructEntry> entries);
   Status GetStruct(std::string_view column, std::string_view key,
                    std::vector<std::byte>& flatBufferBytes) const;
   Status PutRowStruct(std::string_view column, uint64_t rowId, std::string_view key,
@@ -55,6 +68,9 @@ class Database {
                       std::vector<std::byte>& flatBufferBytes) const;
   Status GetMany(std::string_view column, const std::vector<std::string>& keys,
                  std::vector<std::vector<std::byte>>& values) const;
+  Status GetColumnStats(std::vector<ColumnStats>& stats) const;
+  Status DumpColumnStats(std::ostream& output) const;
+  Status Dump(std::ostream& output) const;
 
   [[nodiscard]] bool IsOpen() const;
   [[nodiscard]] uint64_t EntryCount() const;

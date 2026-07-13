@@ -141,6 +141,17 @@ std::vector<std::byte> loaded;
 db.GetStruct("StructA", "object-key", loaded);
 ```
 
+For high-throughput serial object writes, submit a batch for one column. The
+last entry for a duplicate key becomes the current value.
+
+```cpp
+std::vector<LumoDB::StructEntry> entries = {
+    {.key = "object-a", .flatBufferBytes = objectA},
+    {.key = "object-b", .flatBufferBytes = objectB},
+};
+db.PutStructs("StructA", entries);
+```
+
 ### Row API
 
 ```cpp
@@ -170,6 +181,27 @@ std::vector<LumoDB::RowStructEntry> entries = {
 
 db.PutRowStructs("StructA", 42, entries);
 ```
+
+### Diagnostics
+
+`GetColumnStats` returns the current logical object count for each column. It
+combines objects stored through the object and row APIs; `rowCount` identifies
+how many current rows contributed to the count. Entries are ordered by column
+name.
+
+```cpp
+#include <iostream>
+
+std::vector<LumoDB::ColumnStats> stats;
+db.GetColumnStats(stats);
+db.DumpColumnStats(std::cout);
+db.Dump(std::cout);
+```
+
+`Dump` emits the current index-visible database state as text: each object,
+row, row-local key, hash, storage offset, sequence, and value bytes as hexadecimal.
+Because value files are append-only, records replaced by later writes are not
+included in either diagnostic output.
 
 ## FlatBuffers
 
@@ -211,6 +243,9 @@ Object benchmark:
 ```bash
 ./build/lumodb_bench --dir /tmp/lumodb-bench --sizes 1,5,10 --read-count 100
 ```
+
+Use `--object-batch-size 256` to measure batched object writes. The benchmark
+reports payload preparation separately from database write and flush time.
 
 Parallel row benchmark:
 
