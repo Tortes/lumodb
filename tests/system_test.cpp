@@ -232,6 +232,44 @@ TEST(LumoDBSystemTest, WritesReadsRowPayloadsAndReopens) {
   ASSERT_OK(database.Close());
 }
 
+TEST(LumoDBSystemTest, WritesCompleteRowsOnceThenFlushesAndReopens) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("st-complete-row-write");
+
+  LumoDB::DatabaseOptions options;
+  options.initialRowBucketCount = 128;
+  options.rowShardCount = 4;
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  constexpr uint64_t kRowCount = 48;
+  constexpr uint64_t kEntryCount = 16;
+  for (uint64_t rowId = 0; rowId < kRowCount; ++rowId) {
+    // Build every key/value first, then append this row exactly once.
+    RowPayload payload = BuildRowPayload(rowId, kEntryCount);
+    ASSERT_OK(database.PutRowStructs("StructA", rowId, payload.entries));
+  }
+  ASSERT_OK(database.Flush());
+
+  EXPECT_EQ(database.RowCount(), kRowCount);
+  std::vector<LumoDB::ColumnStats> stats;
+  ASSERT_OK(database.GetColumnStats(stats));
+  ASSERT_EQ(stats.size(), 1);
+  EXPECT_EQ(stats[0].column, "StructA");
+  EXPECT_EQ(stats[0].objectCount, kRowCount * kEntryCount);
+  EXPECT_EQ(stats[0].rowCount, kRowCount);
+
+  ASSERT_OK(database.Close());
+  ASSERT_OK(database.Open(directory, options));
+  for (uint64_t rowId = 0; rowId < kRowCount; ++rowId) {
+    for (uint64_t keyIndex = 0; keyIndex < kEntryCount; ++keyIndex) {
+      ExpectRowValue(database, "StructA", rowId, keyIndex);
+    }
+  }
+  ASSERT_OK(database.Close());
+}
+
 TEST(LumoDBSystemTest, WritesSameColumnRowsInParallelAndReadsRowsInParallel) {
   const std::filesystem::path directory =
       LumoDB::test::MakeTestDirectory("st-row-parallel-read-write");
