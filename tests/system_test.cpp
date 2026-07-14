@@ -68,6 +68,12 @@ struct RowPayload {
   std::vector<LumoDB::RowStructEntry> entries;
 };
 
+struct ObjectPayload {
+  std::vector<std::string> keys;
+  std::vector<std::vector<std::byte>> values;
+  std::vector<LumoDB::StructEntry> entries;
+};
+
 RowPayload BuildRowPayload(uint64_t rowId, uint64_t entryCount) {
   RowPayload payload;
   payload.keys.reserve(static_cast<size_t>(entryCount));
@@ -84,6 +90,42 @@ RowPayload BuildRowPayload(uint64_t rowId, uint64_t entryCount) {
   }
 
   return payload;
+}
+
+ObjectPayload BuildObjectPayload(std::string_view prefix, uint64_t entryCount) {
+  ObjectPayload payload;
+  payload.keys.reserve(static_cast<size_t>(entryCount));
+  payload.values.reserve(static_cast<size_t>(entryCount));
+  payload.entries.reserve(static_cast<size_t>(entryCount));
+
+  for (uint64_t index = 0; index < entryCount; ++index) {
+    std::string key = std::string(prefix) + "-key-" + std::to_string(index) + "-" +
+                      std::string(static_cast<size_t>(index % 31 + 1),
+                                  static_cast<char>('a' + index % 26));
+    std::string value = std::string(prefix) + "-value-" + std::to_string(index) + "-" +
+                        std::string(static_cast<size_t>(index % 47 + 1),
+                                    static_cast<char>('A' + index % 26));
+    if (index % 2 == 0) {
+      value.push_back('\0');
+      value += "binary-suffix-" + std::to_string(index);
+    }
+
+    payload.keys.push_back(std::move(key));
+    payload.values.push_back(
+        LumoDB::test::MakeBytes(std::string_view(value.data(), value.size())));
+    payload.entries.push_back({.key = payload.keys.back(),
+                               .flatBufferBytes = payload.values.back()});
+  }
+  return payload;
+}
+
+void ExpectExactObjectPayload(const LumoDB::Database& database, std::string_view column,
+                              const ObjectPayload& payload) {
+  for (size_t index = 0; index < payload.entries.size(); ++index) {
+    std::vector<std::byte> value;
+    ASSERT_OK(database.GetStruct(column, payload.keys[index], value));
+    EXPECT_EQ(value, payload.values[index]) << "key=" << payload.keys[index];
+  }
 }
 
 void ExpectRowValue(const LumoDB::Database& database, std::string_view column,
@@ -446,6 +488,90 @@ TEST(LumoDBSystemTest, UsesImmutableWriteAndReadOnlyWorkflow) {
   VerifyRowsInParallel(database, "RowColumn", kRowCount, kRowEntryCount,
                        kReaderCount, rowReadFailures);
   EXPECT_TRUE(rowReadFailures.Empty()) << rowReadFailures.Report();
+  ASSERT_OK(database.Close());
+}
+
+TEST(LumoDBSystemTest, PreservesExactKeysAndValuesForUniqueAndStructBatches) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("st-exact-object-batches");
+
+  constexpr uint64_t kEntryCount = 300;
+  LumoDB::DatabaseOptions options;
+  options.initialBucketCount = 1024;
+
+  const ObjectPayload uniquePayload =
+      BuildObjectPayload("unique-batch", kEntryCount);
+  const ObjectPayload structsPayload =
+      BuildObjectPayload("structs-batch", kEntryCount);
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+  ASSERT_OK(database.PutUniqueStructs("UniqueColumn", uniquePayload.entries));
+  ASSERT_OK(database.PutStructs("StructsColumn", structsPayload.entries));
+  EXPECT_EQ(database.EntryCount(), kEntryCount * 2);
+
+  ExpectExactObjectPayload(database, "UniqueColumn", uniquePayload);
+  ExpectExactObjectPayload(database, "StructsColumn", structsPayload);
+
+  ASSERT_OK(database.Close());
+  ASSERT_OK(database.OpenReadOnly(directory, options));
+  ExpectExactObjectPayload(database, "UniqueColumn", uniquePayload);
+  ExpectExactObjectPayload(database, "StructsColumn", structsPayload);
+  ASSERT_OK(database.Close());
+}
+
+TEST(LumoDBSystemTest, DumpsOneColumnWithDeserializer) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("st-column-dump-deserializer");
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory));
+  ASSERT_OK(database.PutStruct("StructA", "object-key",
+                               LumoDB::test::MakeBytes("flat-object")));
+  const std::vector<std::byte> first = LumoDB::test::MakeBytes("flat-row-first");
+  const std::vector<std::byte> second = LumoDB::test::MakeBytes("flat-row-second");
+  const std::vector<LumoDB::RowStructEntry> rowEntries = {
+      {.key = "first", .flatBufferBytes = first},
+      {.key = "second", .flatBufferBytes = second},
+  };
+  ASSERT_OK(database.PutRowStructs("StructA", 7, rowEntries));
+  ASSERT_OK(database.PutStruct("OtherColumn", "other-key",
+                               LumoDB::test::MakeBytes("other-value")));
+
+  size_t deserializeCount = 0;
+  const LumoDB::DumpDeserializer deserialize =
+      [&](const LumoDB::DumpValue& value, std::string& text) {
+        ++deserializeCount;
+        const std::string raw(
+            reinterpret_cast<const char*>(value.flatBufferBytes.data()),
+            value.flatBufferBytes.size());
+        text = value.rowId.has_value()
+                   ? "decoded-row-" + std::to_string(*value.rowId) + ":" + raw
+                   : "decoded-object:" + raw;
+        return LumoDB::Status::Ok();
+      };
+
+  std::ostringstream output;
+  ASSERT_OK(database.DumpColumn(output, "StructA", deserialize));
+  const std::string text = output.str();
+  EXPECT_EQ(deserializeCount, 3);
+  EXPECT_NE(text.find("LumoDB column dump column=\"StructA\""),
+            std::string::npos);
+  EXPECT_NE(text.find("key=\"object-key\""), std::string::npos);
+  EXPECT_NE(text.find("key=\"first\""), std::string::npos);
+  EXPECT_NE(text.find("deserialized=\"decoded-object:flat-object\""),
+            std::string::npos);
+  EXPECT_NE(text.find("deserialized=\"decoded-row-7:flat-row-first\""),
+            std::string::npos);
+  EXPECT_EQ(text.find("OtherColumn"), std::string::npos);
+
+  std::ostringstream failedOutput;
+  const LumoDB::Status failed = database.DumpColumn(
+      failedOutput, "StructA",
+      [](const LumoDB::DumpValue&, std::string&) {
+        return LumoDB::Status::InvalidArgument("cannot decode value");
+      });
+  EXPECT_EQ(failed.Code(), LumoDB::StatusCode::kInvalidArgument);
   ASSERT_OK(database.Close());
 }
 

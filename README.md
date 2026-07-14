@@ -238,6 +238,20 @@ row, row-local key, hash, storage offset, sequence, and value bytes as hexadecim
 Because value files are append-only, records replaced by later writes are not
 included in either diagnostic output.
 
+`DumpColumn` limits output to one column. Pass a `DumpDeserializer` to turn each
+FlatBuffer payload into diagnostic text before LumoDB prints that value. The
+callback is diagnostic-only and must not retain the supplied byte span.
+
+```cpp
+LumoDB::DumpDeserializer deserialize =
+    [](const LumoDB::DumpValue& value, std::string& text) {
+      text = DescribeMyFlatBuffer(value.flatBufferBytes);
+      return LumoDB::Status::Ok();
+    };
+
+db.DumpColumn(std::cout, "StructA", deserialize);
+```
+
 ## FlatBuffers
 
 The example schema is in `schemas/example.fbs`.

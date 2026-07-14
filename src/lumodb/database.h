@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iosfwd>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -35,6 +37,15 @@ struct ColumnStats {
   uint64_t objectCount = 0;
   uint64_t rowCount = 0;
 };
+
+struct DumpValue {
+  std::string_view column;
+  std::optional<uint64_t> rowId;
+  std::string_view key;
+  std::span<const std::byte> flatBufferBytes;
+};
+
+using DumpDeserializer = std::function<Status(const DumpValue&, std::string& text)>;
 
 class Database {
  public:
@@ -76,6 +87,8 @@ class Database {
   Status GetColumnStats(std::vector<ColumnStats>& stats) const;
   Status DumpColumnStats(std::ostream& output) const;
   Status Dump(std::ostream& output) const;
+  Status DumpColumn(std::ostream& output, std::string_view column,
+                    const DumpDeserializer& deserialize = {}) const;
 
   [[nodiscard]] bool IsOpen() const;
   [[nodiscard]] uint64_t EntryCount() const;

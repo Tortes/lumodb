@@ -677,13 +677,32 @@ class Database::Impl {
   }
 
   Status Dump(std::ostream& output) const {
+    return DumpInternal(output, std::nullopt, {});
+  }
+
+  Status DumpColumn(std::ostream& output, std::string_view column,
+                    const DumpDeserializer& deserialize) const {
+    return DumpInternal(output, std::optional<std::string_view>(column), deserialize);
+  }
+
+  Status DumpInternal(std::ostream& output,
+                      std::optional<std::string_view> columnFilter,
+                      const DumpDeserializer& deserialize) const {
     if (!open_) {
       return Status::NotOpen("database is not open");
     }
 
-    output << "LumoDB dump\n";
-    output << "object_index: entries=" << EntryCount()
-           << " buckets=" << BucketCount() << '\n';
+    if (columnFilter.has_value()) {
+      output << "LumoDB column dump column=" << EscapeText(*columnFilter) << '\n';
+    } else {
+      output << "LumoDB dump\n";
+    }
+    if (columnFilter.has_value()) {
+      output << "object_index: buckets=" << BucketCount() << '\n';
+    } else {
+      output << "object_index: entries=" << EntryCount()
+             << " buckets=" << BucketCount() << '\n';
+    }
     output << "objects:\n";
     for (uint64_t index = 0; index < IndexHeader()->bucketCount; ++index) {
       const detail::IndexBucket& bucket = Buckets()[index];
@@ -707,6 +726,9 @@ class Database::Impl {
       if (!status) {
         return status;
       }
+      if (columnFilter.has_value() && column != *columnFilter) {
+        continue;
+      }
       const uint64_t valueOffset =
           bucket.recordOffset + sizeof(detail::ValueRecordHeader) +
           recordHeader.columnSize + recordHeader.keySize;
@@ -719,6 +741,19 @@ class Database::Impl {
         return status;
       }
 
+      std::string deserialized;
+      if (deserialize) {
+        status = deserialize(
+            {.column = column,
+             .rowId = std::nullopt,
+             .key = key,
+             .flatBufferBytes = std::span<const std::byte>(value)},
+            deserialized);
+        if (!status) {
+          return status;
+        }
+      }
+
       output << "  object bucket=" << index
              << " column=" << EscapeText(column)
              << " key=" << EscapeText(key)
@@ -729,14 +764,24 @@ class Database::Impl {
              << " value_offset=" << valueOffset
              << " value_size=" << recordHeader.valueSize
              << " record_size=" << recordSize
-             << " value_hex=" << HexBytes(value) << '\n';
+             << " value_hex=" << HexBytes(value);
+      if (deserialize) {
+        output << " deserialized=" << EscapeText(deserialized);
+      }
+      output << '\n';
     }
 
-    output << "row_index: rows=" << RowCount()
-           << " buckets=" << RowBucketCount()
-           << " shards=" << rowValueFiles_.size()
-           << " next_sequence="
-           << AtomicLoad(RowIndexHeader()->nextSequence, std::memory_order_acquire) << '\n';
+    if (columnFilter.has_value()) {
+      output << "row_index: buckets=" << RowBucketCount()
+             << " shards=" << rowValueFiles_.size() << '\n';
+    } else {
+      output << "row_index: rows=" << RowCount()
+             << " buckets=" << RowBucketCount()
+             << " shards=" << rowValueFiles_.size()
+             << " next_sequence="
+             << AtomicLoad(RowIndexHeader()->nextSequence, std::memory_order_acquire)
+             << '\n';
+    }
     output << "rows:\n";
     for (uint64_t index = 0; index < RowIndexHeader()->bucketCount; ++index) {
       detail::RowIndexBucket bucket;
@@ -768,6 +813,9 @@ class Database::Impl {
           static_cast<uint64_t>(blockHeader->bucketCount) * sizeof(detail::RowKeyBucket);
       const auto* columnData = reinterpret_cast<const char*>(block.data() + columnOffset);
       const std::string column(columnData, blockHeader->columnSize);
+      if (columnFilter.has_value() && column != *columnFilter) {
+        continue;
+      }
       std::vector<std::string> keys;
       std::vector<std::vector<std::byte>> values;
       status = DecodeRowBlockEntries(block, column, bucket.rowId, keys, values);
@@ -785,9 +833,25 @@ class Database::Impl {
              << " block_size=" << bucket.blockSize
              << " object_count=" << blockHeader->itemCount << '\n';
       for (size_t entry = 0; entry < keys.size(); ++entry) {
+        std::string deserialized;
+        if (deserialize) {
+          status = deserialize(
+              {.column = column,
+               .rowId = bucket.rowId,
+               .key = keys[entry],
+               .flatBufferBytes = std::span<const std::byte>(values[entry])},
+              deserialized);
+          if (!status) {
+            return status;
+          }
+        }
         output << "    key=" << EscapeText(keys[entry])
                << " value_size=" << values[entry].size()
-               << " value_hex=" << HexBytes(values[entry]) << '\n';
+               << " value_hex=" << HexBytes(values[entry]);
+        if (deserialize) {
+          output << " deserialized=" << EscapeText(deserialized);
+        }
+        output << '\n';
       }
     }
 
@@ -798,6 +862,9 @@ class Database::Impl {
       return status;
     }
     for (const ColumnStats& columnStats : stats) {
+      if (columnFilter.has_value() && columnStats.column != *columnFilter) {
+        continue;
+      }
       output << "  column=" << EscapeText(columnStats.column)
              << " objects=" << columnStats.objectCount
              << " rows=" << columnStats.rowCount << '\n';
@@ -2449,6 +2516,12 @@ Status Database::DumpColumnStats(std::ostream& output) const {
 Status Database::Dump(std::ostream& output) const {
   return impl_ == nullptr ? Status::NotOpen("database is not open")
                           : impl_->Dump(output);
+}
+
+Status Database::DumpColumn(std::ostream& output, std::string_view column,
+                            const DumpDeserializer& deserialize) const {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->DumpColumn(output, column, deserialize);
 }
 
 bool Database::IsOpen() const {
