@@ -276,7 +276,9 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
   }
 
   LumoDB::Database database;
+  const auto databaseOpenStart = std::chrono::steady_clock::now();
   LumoDB::Status status = database.Open(runDirectory, databaseOptions);
+  const auto databaseOpenEnd = std::chrono::steady_clock::now();
   if (!status) {
     std::cerr << "open failed: " << status.Message() << '\n';
     std::exit(EXIT_FAILURE);
@@ -335,6 +337,11 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
     std::exit(EXIT_FAILURE);
   }
   auto writeEnd = std::chrono::steady_clock::now();
+  const auto databaseOpenDuration = databaseOpenEnd - databaseOpenStart;
+  const auto databaseTotalDuration =
+      databaseOpenDuration + databaseWriteDuration;
+  const auto buildDuration =
+      databaseOpenDuration + (writeEnd - writeStart);
 
   status = database.OpenReadOnly(runDirectory, databaseOptions);
   if (!status) {
@@ -365,11 +372,17 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
             << " shared_payload=" << options.sharedPayload
             << " write=" << FormatSeconds(writeEnd - writeStart)
             << " throughput=" << FormatMbPerSecond(writtenBytes, writeEnd - writeStart)
+            << " build=" << FormatSeconds(buildDuration)
+            << " build_throughput="
+            << FormatMbPerSecond(writtenBytes, buildDuration)
             << " prepare=" << FormatSeconds(prepareDuration)
+            << " db_open=" << FormatSeconds(databaseOpenDuration)
             << " db_write=" << FormatSeconds(databaseWriteDuration)
-            << " db_throughput=" << FormatMbPerSecond(writtenBytes, databaseWriteDuration)
+            << " db_total=" << FormatSeconds(databaseTotalDuration)
+            << " db_throughput="
+            << FormatMbPerSecond(writtenBytes, databaseTotalDuration)
             << " db_key_rate="
-            << FormatMillionKeysPerSecond(objectCount, databaseWriteDuration)
+            << FormatMillionKeysPerSecond(objectCount, databaseTotalDuration)
             << " read_count=" << options.readCount;
   PrintReadPercentiles(readDurations);
 

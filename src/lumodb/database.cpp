@@ -1644,11 +1644,16 @@ class Database::Impl {
         return status;
       }
       objectIndexConsistent_ = false;
-      status = CreateEmptyIndex(
-          std::max(options_.initialBucketCount, recoveredObjectBucketCount_));
+      const uint64_t rebuildBucketCount =
+          std::max(options_.initialBucketCount, recoveredObjectBucketCount_);
+      ReportWriteProgress(WritePhase::kResizingIndex, 0,
+                          rebuildBucketCount);
+      status = CreateEmptyIndex(rebuildBucketCount);
       if (!status) {
         return status;
       }
+      ReportWriteProgress(WritePhase::kResizingIndex, rebuildBucketCount,
+                          rebuildBucketCount);
       recoveredObjectBucketCount_ = 0;
       uint64_t valueFileSize = 0;
       status = detail::GetFileSize(valueFile_.Get(), valueFileSize);

@@ -341,8 +341,9 @@ million benchmark-only value allocations:
 
 `--progress` prints the active validate, resize, value-write, index-publish, or
 flush phase at most once per second, plus phase boundaries. The close/flush time
-is included in `db_write`, so the reported throughput is not only page-cache
-ingest throughput.
+is included in `db_write`; `db_total` and `db_key_rate` additionally include
+`Open` and index preallocation, so they represent the complete database build
+rather than only page-cache ingest throughput.
 
 Parallel row benchmark:
 
