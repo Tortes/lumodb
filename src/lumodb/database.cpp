@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -23,6 +24,12 @@ namespace {
 
 constexpr std::string_view kStringColumn = "\x1FLumoDB:string";
 constexpr uint64_t kMinimumBucketCount = 16;
+// Small records are cheaper to copy once than to submit as four iovecs each.
+constexpr uint64_t kPackedObjectRecordThreshold = 4 * 1024;
+constexpr size_t kPackedObjectWriteBufferSize = 4 * 1024 * 1024;
+// Bound per-call metadata even when one API call contains millions of entries.
+constexpr size_t kVectoredObjectWriteEntryCount = 256;
+constexpr size_t kObjectIndexPublishChunkSize = 64 * 1024;
 
 uint64_t RoundUpPowerOfTwo(uint64_t value) {
   uint64_t result = kMinimumBucketCount;
@@ -274,16 +281,242 @@ class Database::Impl {
   }
 
   Status PutStructs(std::string_view column, std::span<const StructEntry> entries) {
-    return WriteStructs(column, entries, false);
+    return WriteStructs(column, entries);
   }
 
   Status PutUniqueStructs(std::string_view column,
                           std::span<const StructEntry> entries) {
-    return WriteStructs(column, entries, true);
+    Status status = ValidateStructWrite(column, entries);
+    if (!status || entries.empty()) {
+      return status;
+    }
+
+    const uint64_t columnHash = detail::HashString(column);
+    const uint64_t firstRecordOffset = appendOffset_;
+    uint64_t nextAppendOffset = appendOffset_;
+    status = WriteRecords(column, entries, nextAppendOffset);
+    if (!status) {
+      return status;
+    }
+
+    // The values are durable input for a later rebuild even if index publishing
+    // fails, so never allow a subsequent write to overwrite them.
+    appendOffset_ = nextAppendOffset;
+
+    uint64_t placedCount = 0;
+    uint64_t recordOffset = firstRecordOffset;
+    pendingUniqueBuckets_.clear();
+    pendingUniqueBuckets_.reserve(
+        std::min(entries.size(), kObjectIndexPublishChunkSize));
+    size_t firstEntry = 0;
+    while (firstEntry < entries.size()) {
+      const size_t endEntry =
+          std::min(entries.size(), firstEntry + kObjectIndexPublishChunkSize);
+      pendingUniqueBuckets_.clear();
+      for (size_t index = firstEntry; index < endEntry; ++index) {
+        const StructEntry& entry = entries[index];
+        pendingUniqueBuckets_.push_back(
+            {.hash = ObjectIndexHash(columnHash, detail::HashString(entry.key)),
+             .recordOffset = recordOffset});
+        recordOffset += sizeof(detail::ValueRecordHeader) + column.size() +
+                        entry.key.size() + entry.flatBufferBytes.size();
+      }
+
+      const detail::IndexBucket* pendingBuckets = pendingUniqueBuckets_.data();
+#if defined(__GNUC__) || defined(__clang__)
+      detail::IndexBucket* indexBuckets = Buckets();
+      const uint64_t bucketMask = IndexHeader()->bucketCount - 1;
+#endif
+      for (size_t index = 0; index < pendingUniqueBuckets_.size(); ++index) {
+#if defined(__GNUC__) || defined(__clang__)
+        constexpr size_t kPrefetchDistance = 64;
+        if (index + kPrefetchDistance < pendingUniqueBuckets_.size()) {
+          const uint64_t futureIndex =
+              pendingBuckets[index + kPrefetchDistance].hash & bucketMask;
+          __builtin_prefetch(indexBuckets + futureIndex, 1, 0);
+        }
+#endif
+        status = PlaceNewBucket(pendingBuckets[index]);
+        if (!status) {
+          IndexHeader()->itemCount += placedCount;
+          return status;
+        }
+        ++placedCount;
+      }
+      firstEntry = endEntry;
+    }
+    IndexHeader()->itemCount += placedCount;
+    pendingUniqueBuckets_.clear();
+    return Status::Ok();
   }
 
-  Status WriteStructs(std::string_view column, std::span<const StructEntry> entries,
-                      bool keysAreUnique) {
+  Status WriteRecords(std::string_view column,
+                      std::span<const StructEntry> entries,
+                      uint64_t& nextAppendOffset) {
+    uint64_t writeOffset = appendOffset_;
+    std::array<detail::ValueRecordHeader,
+               kVectoredObjectWriteEntryCount> headers;
+    std::array<detail::WriteSlice,
+               kVectoredObjectWriteEntryCount * 4> recordSlices;
+    size_t firstEntry = 0;
+    while (firstEntry < entries.size()) {
+      const StructEntry& first = entries[firstEntry];
+      const uint64_t firstRecordSize =
+          sizeof(detail::ValueRecordHeader) + column.size() + first.key.size() +
+          first.flatBufferBytes.size();
+
+      if (firstRecordSize <= kPackedObjectRecordThreshold) {
+        size_t endEntry = firstEntry;
+        size_t chunkSize = 0;
+        while (endEntry < entries.size()) {
+          const StructEntry& entry = entries[endEntry];
+          const size_t recordSize = sizeof(detail::ValueRecordHeader) +
+                                    column.size() + entry.key.size() +
+                                    entry.flatBufferBytes.size();
+          if (recordSize > kPackedObjectRecordThreshold ||
+              recordSize > kPackedObjectWriteBufferSize - chunkSize) {
+            break;
+          }
+          chunkSize += recordSize;
+          ++endEntry;
+        }
+
+        objectWriteBuffer_.resize(chunkSize);
+        std::byte* cursor = objectWriteBuffer_.data();
+        for (size_t index = firstEntry; index < endEntry; ++index) {
+          const StructEntry& entry = entries[index];
+          detail::ValueRecordHeader header;
+          header.columnSize = static_cast<uint32_t>(column.size());
+          header.keySize = static_cast<uint32_t>(entry.key.size());
+          header.valueSize = entry.flatBufferBytes.size();
+
+          std::memcpy(cursor, &header, sizeof(header));
+          cursor += sizeof(header);
+          if (!column.empty()) {
+            std::memcpy(cursor, column.data(), column.size());
+            cursor += column.size();
+          }
+          if (!entry.key.empty()) {
+            std::memcpy(cursor, entry.key.data(), entry.key.size());
+            cursor += entry.key.size();
+          }
+          if (!entry.flatBufferBytes.empty()) {
+            std::memcpy(cursor, entry.flatBufferBytes.data(),
+                        entry.flatBufferBytes.size());
+            cursor += entry.flatBufferBytes.size();
+          }
+        }
+
+        Status status = detail::WriteAllAt(
+            valueFile_.Get(), objectWriteBuffer_.data(),
+            objectWriteBuffer_.size(), writeOffset);
+        if (!status) {
+          return status;
+        }
+        writeOffset += chunkSize;
+        firstEntry = endEntry;
+        continue;
+      }
+
+      size_t endEntry = firstEntry;
+      size_t headerCount = 0;
+      size_t sliceCount = 0;
+      uint64_t chunkSize = 0;
+      while (endEntry < entries.size() &&
+             headerCount < kVectoredObjectWriteEntryCount) {
+        const StructEntry& entry = entries[endEntry];
+        const uint64_t recordSize = sizeof(detail::ValueRecordHeader) +
+                                    column.size() + entry.key.size() +
+                                    entry.flatBufferBytes.size();
+        if (recordSize <= kPackedObjectRecordThreshold) {
+          break;
+        }
+
+        detail::ValueRecordHeader& header = headers[headerCount++];
+        header.columnSize = static_cast<uint32_t>(column.size());
+        header.keySize = static_cast<uint32_t>(entry.key.size());
+        header.valueSize = entry.flatBufferBytes.size();
+        recordSlices[sliceCount++] =
+            {.data = &header, .size = sizeof(header)};
+        recordSlices[sliceCount++] =
+            {.data = column.data(), .size = column.size()};
+        recordSlices[sliceCount++] =
+            {.data = entry.key.data(), .size = entry.key.size()};
+        recordSlices[sliceCount++] = {.data = entry.flatBufferBytes.data(),
+                                      .size = entry.flatBufferBytes.size()};
+        chunkSize += recordSize;
+        ++endEntry;
+      }
+
+      Status status = detail::WriteVAllAt(
+          valueFile_.Get(),
+          std::span<const detail::WriteSlice>(recordSlices.data(), sliceCount),
+          writeOffset);
+      if (!status) {
+        return status;
+      }
+      writeOffset += chunkSize;
+      firstEntry = endEntry;
+    }
+    nextAppendOffset = writeOffset;
+    return Status::Ok();
+  }
+
+  Status WriteStructs(std::string_view column,
+                      std::span<const StructEntry> entries) {
+    Status status = ValidateStructWrite(column, entries);
+    if (!status || entries.empty()) {
+      return status;
+    }
+
+    struct PendingRecord {
+      std::string_view key;
+      uint64_t keyHash = 0;
+      uint64_t recordOffset = 0;
+    };
+
+    const uint64_t columnHash = detail::HashString(column);
+    uint64_t nextAppendOffset = appendOffset_;
+    std::vector<PendingRecord> pending;
+    pending.reserve(entries.size());
+
+    for (const StructEntry& entry : entries) {
+      PendingRecord& record = pending.emplace_back();
+      record.key = entry.key;
+      record.recordOffset = nextAppendOffset;
+      record.keyHash = detail::HashString(entry.key);
+      const uint64_t recordSize = sizeof(detail::ValueRecordHeader) + column.size() +
+                                  entry.key.size() + entry.flatBufferBytes.size();
+      nextAppendOffset += recordSize;
+    }
+
+    status = WriteRecords(column, entries, nextAppendOffset);
+    if (!status) {
+      return status;
+    }
+
+    for (const PendingRecord& record : pending) {
+      BucketLookup lookup;
+      status = FindBucket(column, record.key, columnHash, record.keyHash, lookup);
+      if (!status) {
+        return status;
+      }
+
+      detail::IndexBucket bucket;
+      bucket.hash = ObjectIndexHash(columnHash, record.keyHash);
+      bucket.recordOffset = record.recordOffset;
+      Buckets()[lookup.index] = bucket;
+      if (!lookup.found) {
+        MarkObjectBucketOccupied(lookup.index);
+        ++IndexHeader()->itemCount;
+      }
+    }
+    appendOffset_ = nextAppendOffset;
+    return Status::Ok();
+  }
+
+  Status ValidateStructWrite(std::string_view column,
+                             std::span<const StructEntry> entries) {
     if (!open_) {
       return Status::NotOpen("database is not open");
     }
@@ -301,80 +534,7 @@ class Database::Impl {
         return Status::InvalidArgument("key must fit in uint32 length");
       }
     }
-
-    Status status = EnsureCapacityForInsert(entries.size());
-    if (!status) {
-      return status;
-    }
-
-    struct PendingRecord {
-      detail::ValueRecordHeader header;
-      std::string_view key;
-      std::span<const std::byte> value;
-      uint64_t keyHash = 0;
-      uint64_t recordOffset = 0;
-      uint64_t recordSize = 0;
-    };
-
-    const uint64_t columnHash = detail::HashString(column);
-    uint64_t nextAppendOffset = appendOffset_;
-    std::vector<PendingRecord> pending;
-    pending.reserve(entries.size());
-    std::vector<detail::WriteSlice> recordSlices;
-    recordSlices.reserve(entries.size() * 4);
-
-    for (const StructEntry& entry : entries) {
-      PendingRecord& record = pending.emplace_back();
-      record.key = entry.key;
-      record.value = entry.flatBufferBytes;
-      record.recordOffset = nextAppendOffset;
-      record.recordSize = sizeof(detail::ValueRecordHeader) + column.size() +
-                          entry.key.size() + entry.flatBufferBytes.size();
-      record.keyHash = detail::HashString(entry.key);
-      record.header.columnSize = static_cast<uint32_t>(column.size());
-      record.header.keySize = static_cast<uint32_t>(entry.key.size());
-      record.header.valueSize = entry.flatBufferBytes.size();
-
-      recordSlices.push_back({.data = &record.header, .size = sizeof(record.header)});
-      recordSlices.push_back({.data = column.data(), .size = column.size()});
-      recordSlices.push_back({.data = entry.key.data(), .size = entry.key.size()});
-      recordSlices.push_back(
-          {.data = entry.flatBufferBytes.data(), .size = entry.flatBufferBytes.size()});
-      nextAppendOffset += record.recordSize;
-    }
-
-    status = detail::WriteVAllAt(valueFile_.Get(), recordSlices, appendOffset_);
-    if (!status) {
-      return status;
-    }
-
-    for (const PendingRecord& record : pending) {
-      detail::IndexBucket bucket;
-      bucket.hash = ObjectIndexHash(columnHash, record.keyHash);
-      bucket.recordOffset = record.recordOffset;
-
-      if (keysAreUnique) {
-        status = PlaceNewBucket(bucket);
-        if (!status) {
-          return status;
-        }
-        ++IndexHeader()->itemCount;
-        continue;
-      }
-
-      BucketLookup lookup;
-      status = FindBucket(column, record.key, columnHash, record.keyHash, lookup);
-      if (!status) {
-        return status;
-      }
-
-      Buckets()[lookup.index] = bucket;
-      if (!lookup.found) {
-        ++IndexHeader()->itemCount;
-      }
-    }
-    appendOffset_ = nextAppendOffset;
-    return Status::Ok();
+    return EnsureCapacityForInsert(entries.size());
   }
 
   Status GetStruct(std::string_view column, std::string_view key,
@@ -1018,6 +1178,10 @@ class Database::Impl {
     rowPendingInsertCount_.store(0, std::memory_order_relaxed);
     indexMap_.Unmap();
     indexFile_.Reset();
+    std::vector<detail::IndexBucket>().swap(pendingUniqueBuckets_);
+    std::vector<std::byte>().swap(objectWriteBuffer_);
+    std::vector<uint64_t>().swap(objectBucketOccupancy_);
+    objectBucketOccupancyValid_ = false;
     valueMap_.Unmap();
     valueFile_.Reset();
     appendOffset_ = 0;
@@ -1462,7 +1626,9 @@ class Database::Impl {
     return Status::Ok();
   }
 
-  bool HasValidIndexLayout(uint64_t fileSize) const {
+  bool HasValidIndexLayout(uint64_t fileSize) {
+    objectBucketOccupancy_.clear();
+    objectBucketOccupancyValid_ = false;
     if (fileSize < sizeof(detail::IndexFileHeader)) {
       return false;
     }
@@ -1483,13 +1649,27 @@ class Database::Impl {
       return false;
     }
 
+    // The layout validation already scans every bucket. Reuse that scan to build
+    // the write-only side table without adding work to read-only opens.
+    if (!readOnly_) {
+      objectBucketOccupancy_.assign(
+          static_cast<size_t>((header->bucketCount + 63) / 64), 0);
+    }
     uint64_t filledCount = 0;
     for (uint64_t index = 0; index < header->bucketCount; ++index) {
       if (Buckets()[index].hash != 0) {
+        if (!readOnly_) {
+          objectBucketOccupancy_[index / 64] |= 1ULL << (index % 64);
+        }
         ++filledCount;
       }
     }
-    return filledCount == header->itemCount;
+    if (filledCount != header->itemCount) {
+      objectBucketOccupancy_.clear();
+      return false;
+    }
+    objectBucketOccupancyValid_ = !readOnly_;
+    return true;
   }
 
   Status CreateEmptyIndex(uint64_t bucketCount) {
@@ -1498,7 +1678,14 @@ class Database::Impl {
         sizeof(detail::IndexFileHeader) + bucketCount * sizeof(detail::IndexBucket);
 
     indexMap_.Unmap();
-    Status status = detail::TruncateFile(indexFile_.Get(), fileSize);
+    // Shrink first so extending the regular file produces a logically zeroed,
+    // sparse bucket area. Touching the entire mmap here would dirty hundreds of
+    // MiB before the first value write for a multi-million-entry insert.
+    Status status = detail::TruncateFile(indexFile_.Get(), 0);
+    if (!status) {
+      return status;
+    }
+    status = detail::TruncateFile(indexFile_.Get(), fileSize);
     if (!status) {
       return status;
     }
@@ -1507,10 +1694,12 @@ class Database::Impl {
       return status;
     }
 
-    std::memset(indexMap_.Data(), 0, static_cast<size_t>(indexMap_.Size()));
     detail::IndexFileHeader header;
     header.bucketCount = bucketCount;
     *IndexHeader() = header;
+    objectBucketOccupancy_.assign(
+        static_cast<size_t>((bucketCount + 63) / 64), 0);
+    objectBucketOccupancyValid_ = true;
     return Status::Ok();
   }
 
@@ -1566,6 +1755,7 @@ class Database::Impl {
 
       Buckets()[lookup.index] = bucket;
       if (!lookup.found) {
+        MarkObjectBucketOccupied(lookup.index);
         ++IndexHeader()->itemCount;
       }
 
@@ -1946,6 +2136,10 @@ class Database::Impl {
   }
 
   Status PlaceExistingBucket(const detail::IndexBucket& bucket) {
+    if (objectBucketOccupancyValid_) {
+      return PlaceNewBucket(bucket);
+    }
+
     const uint64_t bucketCount = IndexHeader()->bucketCount;
     const uint64_t mask = bucketCount - 1;
     const uint64_t start = bucket.hash & mask;
@@ -1954,6 +2148,7 @@ class Database::Impl {
       const uint64_t index = (start + probe) & mask;
       if (Buckets()[index].hash == 0) {
         Buckets()[index] = bucket;
+        MarkObjectBucketOccupied(index);
         return Status::Ok();
       }
     }
@@ -1965,6 +2160,19 @@ class Database::Impl {
     const uint64_t mask = bucketCount - 1;
     const uint64_t start = bucket.hash & mask;
 
+    if (objectBucketOccupancyValid_) {
+      // Probe the compact, cache-friendly bitmap instead of loading random
+      // 16-byte mmap buckets merely to discover whether they are empty.
+      uint64_t index = 0;
+      if (!FindEmptyObjectBucket(start, bucketCount, index) &&
+          !FindEmptyObjectBucket(0, start, index)) {
+        return Status::Corruption("index table is full during unique insert");
+      }
+      MarkObjectBucketOccupied(index);
+      Buckets()[index] = bucket;
+      return Status::Ok();
+    }
+
     for (uint64_t probe = 0; probe < bucketCount; ++probe) {
       const uint64_t index = (start + probe) & mask;
       if (Buckets()[index].hash == 0) {
@@ -1973,6 +2181,39 @@ class Database::Impl {
       }
     }
     return Status::Corruption("index table is full during unique insert");
+  }
+
+  bool FindEmptyObjectBucket(uint64_t begin, uint64_t end,
+                             uint64_t& index) const {
+    if (begin >= end) {
+      return false;
+    }
+
+    uint64_t wordIndex = begin / 64;
+    uint32_t firstBit = static_cast<uint32_t>(begin % 64);
+    const uint64_t lastWord = (end - 1) / 64;
+    while (wordIndex <= lastWord) {
+      uint64_t available = ~objectBucketOccupancy_[wordIndex];
+      available &= std::numeric_limits<uint64_t>::max() << firstBit;
+      const uint64_t wordEnd = (wordIndex + 1) * 64;
+      if (wordEnd > end) {
+        const uint32_t endBit = static_cast<uint32_t>(end - wordIndex * 64);
+        available &= (1ULL << endBit) - 1;
+      }
+      if (available != 0) {
+        index = wordIndex * 64 + std::countr_zero(available);
+        return true;
+      }
+      ++wordIndex;
+      firstBit = 0;
+    }
+    return false;
+  }
+
+  void MarkObjectBucketOccupied(uint64_t index) {
+    if (objectBucketOccupancyValid_) {
+      objectBucketOccupancy_[index / 64] |= 1ULL << (index % 64);
+    }
   }
 
   Status EnsureRowCapacityForInsert() {
@@ -2399,10 +2640,14 @@ class Database::Impl {
   std::vector<detail::FileDescriptor> rowValueFiles_;
   std::vector<detail::MappedFile> rowValueMaps_;
   std::vector<std::unique_ptr<std::atomic<uint64_t>>> rowAppendOffsets_;
+  std::vector<detail::IndexBucket> pendingUniqueBuckets_;
+  std::vector<std::byte> objectWriteBuffer_;
+  std::vector<uint64_t> objectBucketOccupancy_;
   std::atomic<uint64_t> rowPendingInsertCount_{0};
   uint64_t appendOffset_ = 0;
   bool open_ = false;
   bool readOnly_ = false;
+  bool objectBucketOccupancyValid_ = false;
 };
 
 Database::Database() : impl_(new Impl()) {}

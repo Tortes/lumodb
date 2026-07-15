@@ -29,11 +29,14 @@ struct BenchmarkOptions {
   std::vector<double> sizesGb = {1.0, 5.0, 10.0};
   BenchmarkMode mode = BenchmarkMode::kObject;
   uint64_t payloadSize = 4096;
+  uint64_t objectCount = 0;
   uint64_t objectBatchSize = 1;
+  uint64_t initialBucketCount = 0;
   uint64_t rowEntries = 64;
   uint64_t readCount = 100;
   uint32_t threads = std::max<uint32_t>(1, std::thread::hardware_concurrency());
   uint32_t shards = 8;
+  bool sharedPayload = false;
   bool keepData = false;
 };
 
@@ -86,8 +89,12 @@ BenchmarkOptions ParseArgs(int argc, char** argv) {
       options.mode = ParseMode(nextValue());
     } else if (arg == "--payload-size") {
       options.payloadSize = std::stoull(std::string(nextValue()));
+    } else if (arg == "--object-count") {
+      options.objectCount = std::stoull(std::string(nextValue()));
     } else if (arg == "--object-batch-size") {
       options.objectBatchSize = std::stoull(std::string(nextValue()));
+    } else if (arg == "--initial-bucket-count") {
+      options.initialBucketCount = std::stoull(std::string(nextValue()));
     } else if (arg == "--row-entries") {
       options.rowEntries = std::stoull(std::string(nextValue()));
     } else if (arg == "--read-count") {
@@ -96,6 +103,8 @@ BenchmarkOptions ParseArgs(int argc, char** argv) {
       options.threads = static_cast<uint32_t>(std::stoul(std::string(nextValue())));
     } else if (arg == "--shards") {
       options.shards = static_cast<uint32_t>(std::stoul(std::string(nextValue())));
+    } else if (arg == "--shared-payload") {
+      options.sharedPayload = true;
     } else if (arg == "--keep") {
       options.keepData = true;
     } else {
@@ -138,11 +147,11 @@ std::string FormatSeconds(std::chrono::steady_clock::duration duration) {
   return output.str();
 }
 
-std::string FormatMilliseconds(std::chrono::steady_clock::duration duration) {
-  const double milliseconds =
-      std::chrono::duration<double, std::milli>(duration).count();
+std::string FormatMicroseconds(std::chrono::steady_clock::duration duration) {
+  const double microseconds =
+      std::chrono::duration<double, std::micro>(duration).count();
   std::ostringstream output;
-  output << std::fixed << std::setprecision(3) << milliseconds << "ms";
+  output << std::fixed << std::setprecision(3) << microseconds << "us";
   return output.str();
 }
 
@@ -154,11 +163,25 @@ std::string FormatMbPerSecond(uint64_t bytes, std::chrono::steady_clock::duratio
   return output.str();
 }
 
+std::string FormatMillionKeysPerSecond(
+    uint64_t keyCount, std::chrono::steady_clock::duration duration) {
+  const double seconds = std::chrono::duration<double>(duration).count();
+  std::ostringstream output;
+  output << std::fixed << std::setprecision(2)
+         << (static_cast<double>(keyCount) / seconds / 1'000'000.0)
+         << " Mkeys/s";
+  return output.str();
+}
+
 std::string KeyForIndex(uint64_t index) {
   return "key-" + std::to_string(index);
 }
 
 void PrintReadPercentiles(std::vector<std::chrono::steady_clock::duration>& readDurations) {
+  if (readDurations.empty()) {
+    std::cout << '\n';
+    return;
+  }
   std::sort(readDurations.begin(), readDurations.end());
   auto percentile = [&](double p) {
     const size_t offset = static_cast<size_t>(
@@ -166,29 +189,40 @@ void PrintReadPercentiles(std::vector<std::chrono::steady_clock::duration>& read
     return readDurations[offset];
   };
 
-  std::cout << " p50=" << FormatMilliseconds(percentile(0.50))
-            << " p95=" << FormatMilliseconds(percentile(0.95))
-            << " p99=" << FormatMilliseconds(percentile(0.99)) << '\n';
+  std::cout << " p50=" << FormatMicroseconds(percentile(0.50))
+            << " p95=" << FormatMicroseconds(percentile(0.95))
+            << " p99=" << FormatMicroseconds(percentile(0.99)) << '\n';
 }
 
 void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
   const uint64_t targetBytes =
       static_cast<uint64_t>(std::ceil(sizeGb * 1024.0 * 1024.0 * 1024.0));
-  const uint64_t objectCount =
-      std::max<uint64_t>(1, (targetBytes + options.payloadSize - 1) / options.payloadSize);
+  const uint64_t objectCount = options.objectCount != 0
+                                   ? options.objectCount
+                                   : std::max<uint64_t>(
+                                         1, (targetBytes + options.payloadSize - 1) /
+                                                options.payloadSize);
   const uint64_t writtenBytes = objectCount * options.payloadSize;
+  const double actualSizeGb =
+      static_cast<double>(writtenBytes) / (1024.0 * 1024.0 * 1024.0);
 
   std::filesystem::path runDirectory =
-      options.directory / ("size-" + std::to_string(static_cast<uint64_t>(sizeGb * 1000)));
+      options.directory /
+      (options.objectCount != 0
+           ? "objects-" + std::to_string(objectCount)
+           : "size-" + std::to_string(static_cast<uint64_t>(sizeGb * 1000)));
   if (!options.keepData) {
     std::filesystem::remove_all(runDirectory);
   }
   std::filesystem::create_directories(runDirectory);
 
   LumoDB::DatabaseOptions databaseOptions;
-  databaseOptions.initialBucketCount =
-      RoundUpPowerOfTwo(
-          static_cast<uint64_t>(objectCount / databaseOptions.maxLoadFactor) + 1);
+  databaseOptions.initialBucketCount = options.initialBucketCount != 0
+                                           ? options.initialBucketCount
+                                           : RoundUpPowerOfTwo(static_cast<uint64_t>(
+                                                 objectCount /
+                                                 databaseOptions.maxLoadFactor) +
+                                             1);
 
   LumoDB::Database database;
   LumoDB::Status status = database.Open(runDirectory, databaseOptions);
@@ -199,6 +233,9 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
 
   std::chrono::steady_clock::duration prepareDuration{};
   std::chrono::steady_clock::duration databaseWriteDuration{};
+  const std::vector<std::byte> sharedPayload =
+      options.sharedPayload ? MakeFlatBufferPayload(options.payloadSize, 0)
+                            : std::vector<std::byte>{};
   auto writeStart = std::chrono::steady_clock::now();
   for (uint64_t firstObject = 0; firstObject < objectCount;
        firstObject += options.objectBatchSize) {
@@ -209,13 +246,22 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
     std::vector<std::vector<std::byte>> payloads;
     std::vector<LumoDB::StructEntry> entries;
     keys.reserve(static_cast<size_t>(batchCount));
-    payloads.reserve(static_cast<size_t>(batchCount));
+    if (!options.sharedPayload) {
+      payloads.reserve(static_cast<size_t>(batchCount));
+    }
     entries.reserve(static_cast<size_t>(batchCount));
     for (uint64_t offset = 0; offset < batchCount; ++offset) {
       const uint64_t objectIndex = firstObject + offset;
       keys.push_back(KeyForIndex(objectIndex));
-      payloads.push_back(MakeFlatBufferPayload(options.payloadSize, objectIndex));
-      entries.push_back({.key = keys.back(), .flatBufferBytes = payloads.back()});
+      if (options.sharedPayload) {
+        entries.push_back(
+            {.key = keys.back(), .flatBufferBytes = sharedPayload});
+      } else {
+        payloads.push_back(
+            MakeFlatBufferPayload(options.payloadSize, objectIndex));
+        entries.push_back(
+            {.key = keys.back(), .flatBufferBytes = payloads.back()});
+      }
     }
     const auto prepareEnd = std::chrono::steady_clock::now();
     prepareDuration += prepareEnd - prepareStart;
@@ -262,14 +308,17 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
     readDurations.push_back(readEnd - readStart);
   }
 
-  std::cout << "mode=object size_gb=" << sizeGb << " objects=" << objectCount
+  std::cout << "mode=object size_gb=" << actualSizeGb << " objects=" << objectCount
             << " batch_size=" << options.objectBatchSize
             << " payload=" << options.payloadSize << " bytes"
+            << " shared_payload=" << options.sharedPayload
             << " write=" << FormatSeconds(writeEnd - writeStart)
             << " throughput=" << FormatMbPerSecond(writtenBytes, writeEnd - writeStart)
             << " prepare=" << FormatSeconds(prepareDuration)
             << " db_write=" << FormatSeconds(databaseWriteDuration)
             << " db_throughput=" << FormatMbPerSecond(writtenBytes, databaseWriteDuration)
+            << " db_key_rate="
+            << FormatMillionKeysPerSecond(objectCount, databaseWriteDuration)
             << " read_count=" << options.readCount;
   PrintReadPercentiles(readDurations);
 
@@ -441,6 +490,10 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
 
 int main(int argc, char** argv) {
   BenchmarkOptions options = ParseArgs(argc, argv);
+  if (options.mode == BenchmarkMode::kObject && options.objectCount != 0) {
+    RunObjectMode(options, 0);
+    return EXIT_SUCCESS;
+  }
   for (double sizeGb : options.sizesGb) {
     if (options.mode == BenchmarkMode::kRowParallel) {
       RunRowParallelMode(options, sizeGb);
