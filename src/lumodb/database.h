@@ -15,11 +15,29 @@
 
 namespace LumoDB {
 
+enum class WritePhase {
+  kValidating,
+  kResizingIndex,
+  kWritingValues,
+  kPublishingIndex,
+  kFlushing,
+};
+
+struct WriteProgress {
+  WritePhase phase = WritePhase::kValidating;
+  uint64_t completed = 0;
+  uint64_t total = 0;
+};
+
+using WriteProgressCallback = std::function<void(const WriteProgress&)>;
+
 struct DatabaseOptions {
   uint64_t initialBucketCount = 1ULL << 16;
   uint64_t initialRowBucketCount = 1ULL << 16;
   uint32_t rowShardCount = 8;
   double maxLoadFactor = 0.80;
+  // Invoked synchronously at coarse-grained write boundaries. Keep it cheap.
+  WriteProgressCallback writeProgress;
 };
 
 struct RowStructEntry {

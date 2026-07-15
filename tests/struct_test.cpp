@@ -1,8 +1,12 @@
 #include "test_utils.h"
 
+#include <algorithm>
+#include <array>
 #include <filesystem>
+#include <limits>
 #include <vector>
 
+#include "lumodb/file.h"
 #include "lumodb/storage_format.h"
 
 namespace {
@@ -283,6 +287,107 @@ TEST(StructStorageTest, PutUniqueStructsHandlesPackedChunksAndDenseIndexes) {
   ASSERT_OK(database.GetStruct("StructA", resizeKeys.back(), value));
   EXPECT_EQ(value, payload);
   ASSERT_OK(database.Close());
+}
+
+TEST(StructStorageTest, PutUniqueStructsReportsCoarseWriteProgress) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("struct-unique-progress");
+
+  std::vector<LumoDB::WriteProgress> progress;
+  LumoDB::DatabaseOptions options;
+  options.initialBucketCount = 16;
+  options.writeProgress = [&](const LumoDB::WriteProgress& update) {
+    progress.push_back(update);
+  };
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+  const std::vector<std::byte> payload(64, std::byte{0x41});
+  const std::vector<LumoDB::StructEntry> entries = {
+      {.key = "first", .flatBufferBytes = payload},
+      {.key = "second", .flatBufferBytes = payload},
+  };
+  ASSERT_OK(database.PutUniqueStructs("StructA", entries));
+  ASSERT_OK(database.Flush());
+
+  const auto hasCompletedPhase = [&](LumoDB::WritePhase phase,
+                                     uint64_t total) {
+    return std::any_of(progress.begin(), progress.end(),
+                       [&](const LumoDB::WriteProgress& update) {
+                         return update.phase == phase &&
+                                update.completed == total &&
+                                update.total == total;
+                       });
+  };
+  EXPECT_TRUE(hasCompletedPhase(LumoDB::WritePhase::kValidating,
+                                entries.size()));
+  EXPECT_TRUE(hasCompletedPhase(LumoDB::WritePhase::kWritingValues,
+                                entries.size()));
+  EXPECT_TRUE(hasCompletedPhase(LumoDB::WritePhase::kPublishingIndex,
+                                entries.size()));
+  EXPECT_TRUE(std::any_of(progress.begin(), progress.end(),
+                          [](const LumoDB::WriteProgress& update) {
+                            return update.phase == LumoDB::WritePhase::kFlushing &&
+                                   update.completed == update.total;
+                          }));
+  EXPECT_FALSE(std::filesystem::exists(directory / "object_write.lumotxn"));
+  ASSERT_OK(database.Close());
+}
+
+TEST(StructStorageTest, RecoversAnInterruptedUniqueBatchBeforeOpeningIndex) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("struct-unique-interrupted");
+
+  const std::vector<std::byte> payload = LumoDB::test::MakeBytes("committed");
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory));
+  const std::array<LumoDB::StructEntry, 1> committedEntry = {
+      LumoDB::StructEntry{.key = "committed-key", .flatBufferBytes = payload},
+  };
+  ASSERT_OK(database.PutUniqueStructs("StructA", committedEntry));
+  ASSERT_OK(database.Close());
+
+  const std::filesystem::path valuePath = directory / "values.lumov";
+  const uint64_t rollbackOffset = std::filesystem::file_size(valuePath);
+  LumoDB::detail::FileDescriptor valueFile;
+  ASSERT_OK(LumoDB::detail::OpenReadWriteCreate(valuePath, valueFile));
+  const std::array<std::byte, 17> incompleteTail = {};
+  ASSERT_OK(LumoDB::detail::WriteAllAt(valueFile.Get(), incompleteTail.data(),
+                                      incompleteTail.size(), rollbackOffset));
+  ASSERT_OK(LumoDB::detail::SyncFile(valueFile.Get()));
+  valueFile.Reset();
+
+  LumoDB::detail::ObjectWriteMarker marker;
+  marker.rollbackOffset = rollbackOffset;
+  LumoDB::detail::FileDescriptor markerFile;
+  ASSERT_OK(LumoDB::detail::OpenReadWriteCreate(
+      directory / "object_write.lumotxn", markerFile));
+  ASSERT_OK(LumoDB::detail::TruncateFile(markerFile.Get(), 0));
+  ASSERT_OK(LumoDB::detail::WriteAllAt(markerFile.Get(), &marker, sizeof(marker), 0));
+  ASSERT_OK(LumoDB::detail::SyncFile(markerFile.Get()));
+  markerFile.Reset();
+  ASSERT_OK(LumoDB::detail::SyncDirectory(directory));
+
+  EXPECT_EQ(database.OpenReadOnly(directory).Code(),
+            LumoDB::StatusCode::kCorruption);
+  ASSERT_OK(database.Open(directory));
+  EXPECT_EQ(std::filesystem::file_size(valuePath), rollbackOffset);
+  std::vector<std::byte> value;
+  ASSERT_OK(database.GetStruct("StructA", "committed-key", value));
+  EXPECT_EQ(value, payload);
+  ASSERT_OK(database.Close());
+  EXPECT_FALSE(std::filesystem::exists(directory / "object_write.lumotxn"));
+}
+
+TEST(StructStorageTest, RejectsInitialBucketCountsThatWouldOverflow) {
+  const std::filesystem::path directory =
+      LumoDB::test::MakeTestDirectory("struct-bucket-overflow");
+
+  LumoDB::DatabaseOptions options;
+  options.initialBucketCount = std::numeric_limits<uint64_t>::max();
+  LumoDB::Database database;
+  EXPECT_EQ(database.Open(directory, options).Code(),
+            LumoDB::StatusCode::kInvalidArgument);
 }
 
 TEST(StructStorageTest, UsesCompactIndexAndMapsClosedDatabaseReadOnly) {

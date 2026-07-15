@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -37,15 +38,18 @@ struct BenchmarkOptions {
   uint32_t threads = std::max<uint32_t>(1, std::thread::hardware_concurrency());
   uint32_t shards = 8;
   bool sharedPayload = false;
+  bool showProgress = false;
   bool keepData = false;
 };
 
 uint64_t RoundUpPowerOfTwo(uint64_t value) {
-  uint64_t result = 16;
-  while (result < value) {
-    result <<= 1;
+  if (value <= 16) {
+    return 16;
   }
-  return result;
+  if (value > (1ULL << 63)) {
+    return 0;
+  }
+  return std::bit_ceil(value);
 }
 
 std::vector<double> ParseSizes(std::string_view text) {
@@ -105,6 +109,8 @@ BenchmarkOptions ParseArgs(int argc, char** argv) {
       options.shards = static_cast<uint32_t>(std::stoul(std::string(nextValue())));
     } else if (arg == "--shared-payload") {
       options.sharedPayload = true;
+    } else if (arg == "--progress") {
+      options.showProgress = true;
     } else if (arg == "--keep") {
       options.keepData = true;
     } else {
@@ -177,6 +183,22 @@ std::string KeyForIndex(uint64_t index) {
   return "key-" + std::to_string(index);
 }
 
+std::string_view WritePhaseName(LumoDB::WritePhase phase) {
+  switch (phase) {
+    case LumoDB::WritePhase::kValidating:
+      return "validate";
+    case LumoDB::WritePhase::kResizingIndex:
+      return "resize-index";
+    case LumoDB::WritePhase::kWritingValues:
+      return "write-values";
+    case LumoDB::WritePhase::kPublishingIndex:
+      return "publish-index";
+    case LumoDB::WritePhase::kFlushing:
+      return "flush";
+  }
+  return "unknown";
+}
+
 void PrintReadPercentiles(std::vector<std::chrono::steady_clock::duration>& readDurations) {
   if (readDurations.empty()) {
     std::cout << '\n';
@@ -223,6 +245,35 @@ void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
                                                  objectCount /
                                                  databaseOptions.maxLoadFactor) +
                                              1);
+  auto lastProgressTime = std::chrono::steady_clock::time_point{};
+  LumoDB::WritePhase lastProgressPhase = LumoDB::WritePhase::kValidating;
+  bool hasProgressPhase = false;
+  if (options.showProgress) {
+    databaseOptions.writeProgress =
+        [&](const LumoDB::WriteProgress& progress) {
+          const auto now = std::chrono::steady_clock::now();
+          const bool phaseChanged =
+              !hasProgressPhase || progress.phase != lastProgressPhase;
+          const bool intervalElapsed =
+              now - lastProgressTime >= std::chrono::seconds(1);
+          if (!phaseChanged && !intervalElapsed &&
+              progress.completed != progress.total) {
+            return;
+          }
+          const double percent =
+              progress.total == 0
+                  ? 100.0
+                  : 100.0 * static_cast<double>(progress.completed) /
+                        static_cast<double>(progress.total);
+          std::cerr << "phase=" << WritePhaseName(progress.phase)
+                    << " completed=" << progress.completed << '/'
+                    << progress.total << " percent=" << std::fixed
+                    << std::setprecision(1) << percent << "%\n";
+          lastProgressTime = now;
+          lastProgressPhase = progress.phase;
+          hasProgressPhase = true;
+        };
+  }
 
   LumoDB::Database database;
   LumoDB::Status status = database.Open(runDirectory, databaseOptions);

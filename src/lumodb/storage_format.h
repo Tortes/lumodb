@@ -15,6 +15,8 @@ inline constexpr std::array<char, 8> kLegacyValueFileMagic = {'L', 'U', 'M', 'V'
                                                               '0', '0', '0', '1'};
 inline constexpr std::array<char, 8> kIndexFileMagic = {'L', 'U', 'M', 'I',
                                                         '0', '0', '0', '2'};
+inline constexpr std::array<char, 8> kObjectWriteMarkerMagic = {
+    'L', 'U', 'M', 'O', 'T', 'X', 'N', '1'};
 inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R',
                                                            'V', '0', '0', '1'};
 inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R',
@@ -69,6 +71,14 @@ struct IndexFileHeader {
 struct IndexBucket {
   uint64_t hash = 0;
   uint64_t recordOffset = 0;
+};
+
+struct ObjectWriteMarker {
+  std::array<char, 8> magic = kObjectWriteMarkerMagic;
+  uint32_t version = kStorageVersion;
+  uint32_t headerSize = sizeof(ObjectWriteMarker);
+  uint64_t rollbackOffset = sizeof(ValueFileHeader);
+  uint64_t indexBucketCount = 0;
 };
 
 struct RowValueFileHeader {
@@ -133,6 +143,7 @@ static_assert(sizeof(ValueRecordHeader) == 24);
 static_assert(sizeof(LegacyValueRecordHeader) == 48);
 static_assert(sizeof(IndexFileHeader) == 64);
 static_assert(sizeof(IndexBucket) == 16);
+static_assert(sizeof(ObjectWriteMarker) == 32);
 static_assert(sizeof(RowValueFileHeader) == 24);
 static_assert(sizeof(RowIndexFileHeader) == 64);
 static_assert(sizeof(RowIndexBucket) == 64);

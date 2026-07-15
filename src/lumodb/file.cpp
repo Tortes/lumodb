@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -159,10 +160,41 @@ Status GetFileSize(int fd, uint64_t& size) {
 }
 
 Status TruncateFile(int fd, uint64_t size) {
+  if (size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+    return Status::InvalidArgument("file size exceeds off_t");
+  }
   if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
     return Status::IoError(ErrnoMessage("ftruncate"));
   }
   return Status::Ok();
+}
+
+Status PreallocateFile(int fd, uint64_t size) {
+  if (size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+    return Status::InvalidArgument("file size exceeds off_t");
+  }
+#if defined(__APPLE__)
+  fstore_t allocation{};
+  allocation.fst_flags = F_ALLOCATECONTIG;
+  allocation.fst_posmode = F_PEOFPOSMODE;
+  allocation.fst_offset = 0;
+  allocation.fst_length = static_cast<off_t>(size);
+  if (fcntl(fd, F_PREALLOCATE, &allocation) != 0) {
+    allocation.fst_flags = F_ALLOCATEALL;
+    if (fcntl(fd, F_PREALLOCATE, &allocation) != 0) {
+      return Status::IoError(ErrnoMessage("fcntl(F_PREALLOCATE)"));
+    }
+  }
+  return TruncateFile(fd, size);
+#else
+  const int result =
+      posix_fallocate(fd, 0, static_cast<off_t>(size));
+  if (result != 0) {
+    errno = result;
+    return Status::IoError(ErrnoMessage("posix_fallocate"));
+  }
+  return Status::Ok();
+#endif
 }
 
 Status SyncFile(int fd) {
@@ -170,6 +202,15 @@ Status SyncFile(int fd) {
     return Status::IoError(ErrnoMessage("fsync"));
   }
   return Status::Ok();
+}
+
+Status SyncDirectory(const std::filesystem::path& directory) {
+  const int rawFd = open(directory.c_str(), O_RDONLY);
+  if (rawFd < 0) {
+    return Status::IoError(ErrnoMessage("open directory " + directory.string()));
+  }
+  FileDescriptor fd(rawFd);
+  return SyncFile(fd.Get());
 }
 
 Status ReadAllAt(int fd, void* data, size_t size, uint64_t offset) {
@@ -207,6 +248,9 @@ Status WriteAllAt(int fd, const void* data, size_t size, uint64_t offset) {
         continue;
       }
       return Status::IoError(ErrnoMessage("pwrite"));
+    }
+    if (writeSize == 0) {
+      return Status::IoError("pwrite wrote zero bytes");
     }
     cursor += writeSize;
     currentOffset += static_cast<uint64_t>(writeSize);

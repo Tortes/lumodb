@@ -69,7 +69,9 @@ Status OpenReadWriteCreate(const std::filesystem::path& path, FileDescriptor& fd
 Status OpenReadOnly(const std::filesystem::path& path, FileDescriptor& fd);
 Status GetFileSize(int fd, uint64_t& size);
 Status TruncateFile(int fd, uint64_t size);
+Status PreallocateFile(int fd, uint64_t size);
 Status SyncFile(int fd);
+Status SyncDirectory(const std::filesystem::path& directory);
 Status ReadAllAt(int fd, void* data, size_t size, uint64_t offset);
 Status WriteAllAt(int fd, const void* data, size_t size, uint64_t offset);
 Status WriteVAllAt(int fd, std::span<const WriteSlice> slices, uint64_t offset);

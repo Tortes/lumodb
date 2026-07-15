@@ -174,6 +174,9 @@ input as one large batch instead of calling the API once per key:
 LumoDB::DatabaseOptions options;
 options.initialBucketCount =
     static_cast<uint64_t>(expectedKeyCount / options.maxLoadFactor) + 1;
+options.writeProgress = [](const LumoDB::WriteProgress& progress) {
+  // Forward coarse validate/resize/value/index/flush progress to your logger.
+};
 db.Open("/tmp/lumodb", options);
 
 // The API keeps its internal memory bounded even if entries contains millions
@@ -184,11 +187,17 @@ db.PutUniqueStructs("StructA", entries);
 The unique path combines records up to 4 KiB into multi-megabyte sequential
 writes. Larger records use bounded `pwritev` batches, and index entries are
 published in fixed-size chunks only after all values have been appended. Index
-growth uses zero-filled sparse file extents instead of dirtying every empty
-bucket page up front. These optimizations keep database-owned batch metadata to
-a few MiB and do not change the on-disk layout or point-read path. Avoid `Flush`
-between batches; call it only at a durability boundary, or let `Close` perform
-the final sync.
+growth physically reserves the final file before mmap stores begin, without
+dirtying every empty bucket page up front. This prevents a sparse mmap from
+failing later with `SIGBUS` when the filesystem runs out of space. These
+optimizations keep database-owned batch metadata to a few MiB and do not change
+the final on-disk index layout or point-read path.
+
+An object-write marker stays present until `Flush` or `Close` has persisted both
+the value and index files. If the process stops first, the next read-write open
+rolls the uncommitted object tail back and rebuilds the index; a read-only open
+refuses the database until that recovery has run. Avoid `Flush` between batches;
+call it only at a durability boundary, or let `Close` perform the final sync.
 
 ### Row API
 
@@ -327,8 +336,13 @@ million benchmark-only value allocations:
 ```bash
 ./build/lumodb_bench --dir /tmp/lumodb-bench --object-count 10000000 \
   --object-batch-size 10000000 --payload-size 16 --shared-payload \
-  --initial-bucket-count 65536 --read-count 100
+  --initial-bucket-count 16777216 --progress --read-count 100
 ```
+
+`--progress` prints the active validate, resize, value-write, index-publish, or
+flush phase at most once per second, plus phase boundaries. The close/flush time
+is included in `db_write`, so the reported throughput is not only page-cache
+ingest throughput.
 
 Parallel row benchmark:
 
