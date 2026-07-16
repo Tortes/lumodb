@@ -10,5 +10,7 @@ DESIGN.md
 *.lumoi
 *.lumorv
 *.lumori
+*.lumost
+build.incomplete*
 
 .DS_Store

@@ -1,16 +1,11 @@
 #include <algorithm>
-#include <atomic>
-#include <bit>
 #include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <random>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -20,532 +15,83 @@
 
 namespace {
 
-enum class BenchmarkMode {
-  kObject,
-  kRowParallel,
-};
-
-struct BenchmarkOptions {
-  std::filesystem::path directory = std::filesystem::temp_directory_path() / "lumodb-bench";
-  std::vector<double> sizesGb = {1.0, 5.0, 10.0};
-  BenchmarkMode mode = BenchmarkMode::kObject;
-  uint64_t payloadSize = 4096;
-  uint64_t objectCount = 0;
-  uint64_t objectBatchSize = 1;
-  uint64_t initialBucketCount = 0;
-  uint64_t rowEntries = 64;
-  uint64_t readCount = 100;
+struct Options {
+  std::filesystem::path directory =
+      std::filesystem::temp_directory_path() / "lumodb-auto-row-bench";
+  uint64_t entries = 10'000'000;
+  uint32_t valueBytes = 16;
   uint32_t threads = std::max<uint32_t>(1, std::thread::hardware_concurrency());
-  uint32_t shards = 8;
-  bool sharedPayload = false;
-  bool showProgress = false;
-  bool keepData = false;
+  uint32_t rowShards = 0;
+  uint64_t memoryBytes = 64ULL * 1024 * 1024 * 1024;
+  uint64_t reads = 10'000;
+  bool keep = false;
 };
 
-uint64_t RoundUpPowerOfTwo(uint64_t value) {
-  if (value <= 16) {
-    return 16;
-  }
-  if (value > (1ULL << 63)) {
-    return 0;
-  }
-  return std::bit_ceil(value);
-}
-
-std::vector<double> ParseSizes(std::string_view text) {
-  std::vector<double> sizes;
-  std::stringstream stream{std::string(text)};
-  std::string item;
-  while (std::getline(stream, item, ',')) {
-    sizes.push_back(std::stod(item));
-  }
-  return sizes;
-}
-
-BenchmarkMode ParseMode(std::string_view text) {
-  if (text == "object") {
-    return BenchmarkMode::kObject;
-  }
-  if (text == "row-parallel") {
-    return BenchmarkMode::kRowParallel;
-  }
-  std::cerr << "unknown mode: " << text << '\n';
-  std::exit(EXIT_FAILURE);
-}
-
-BenchmarkOptions ParseArgs(int argc, char** argv) {
-  BenchmarkOptions options;
+Options ParseOptions(int argc, char** argv) {
+  Options options;
   for (int index = 1; index < argc; ++index) {
-    std::string_view arg = argv[index];
-    auto nextValue = [&]() -> std::string_view {
-      if (index + 1 >= argc) {
-        std::cerr << "missing value for " << arg << '\n';
+    const std::string_view argument = argv[index];
+    auto next = [&]() -> std::string_view {
+      if (++index >= argc) {
+        std::cerr << "missing value for " << argument << '\n';
         std::exit(EXIT_FAILURE);
       }
-      return argv[++index];
+      return argv[index];
     };
-
-    if (arg == "--dir") {
-      options.directory = std::string(nextValue());
-    } else if (arg == "--sizes") {
-      options.sizesGb = ParseSizes(nextValue());
-    } else if (arg == "--mode") {
-      options.mode = ParseMode(nextValue());
-    } else if (arg == "--payload-size") {
-      options.payloadSize = std::stoull(std::string(nextValue()));
-    } else if (arg == "--object-count") {
-      options.objectCount = std::stoull(std::string(nextValue()));
-    } else if (arg == "--object-batch-size") {
-      options.objectBatchSize = std::stoull(std::string(nextValue()));
-    } else if (arg == "--initial-bucket-count") {
-      options.initialBucketCount = std::stoull(std::string(nextValue()));
-    } else if (arg == "--row-entries") {
-      options.rowEntries = std::stoull(std::string(nextValue()));
-    } else if (arg == "--read-count") {
-      options.readCount = std::stoull(std::string(nextValue()));
-    } else if (arg == "--threads") {
-      options.threads = static_cast<uint32_t>(std::stoul(std::string(nextValue())));
-    } else if (arg == "--shards") {
-      options.shards = static_cast<uint32_t>(std::stoul(std::string(nextValue())));
-    } else if (arg == "--shared-payload") {
-      options.sharedPayload = true;
-    } else if (arg == "--progress") {
-      options.showProgress = true;
-    } else if (arg == "--keep") {
-      options.keepData = true;
+    if (argument == "--dir") {
+      options.directory = std::string(next());
+    } else if (argument == "--entries") {
+      options.entries = std::stoull(std::string(next()));
+    } else if (argument == "--value-bytes") {
+      options.valueBytes = static_cast<uint32_t>(std::stoul(std::string(next())));
+    } else if (argument == "--threads") {
+      options.threads = static_cast<uint32_t>(std::stoul(std::string(next())));
+    } else if (argument == "--row-shards") {
+      options.rowShards = static_cast<uint32_t>(std::stoul(std::string(next())));
+    } else if (argument == "--memory-gb") {
+      options.memoryBytes =
+          static_cast<uint64_t>(std::stod(std::string(next())) * 1024 * 1024 * 1024);
+    } else if (argument == "--reads") {
+      options.reads = std::stoull(std::string(next()));
+    } else if (argument == "--keep") {
+      options.keep = true;
+    } else if (argument == "--help") {
+      std::cout << "lumodb_bench [--dir PATH] [--entries N] [--value-bytes N] "
+                   "[--threads N] [--row-shards N] [--memory-gb N] [--reads N] "
+                   "[--keep]\n";
+      std::exit(EXIT_SUCCESS);
     } else {
-      std::cerr << "unknown argument: " << arg << '\n';
+      std::cerr << "unknown argument: " << argument << '\n';
       std::exit(EXIT_FAILURE);
     }
   }
-  if (options.objectBatchSize == 0 || options.rowEntries == 0 || options.threads == 0 ||
-      options.shards == 0) {
-    std::cerr << "object-batch-size, row-entries, threads, and shards must be greater than zero\n";
+  if (options.entries == 0 || options.threads == 0 || options.memoryBytes == 0) {
+    std::cerr << "entries, threads, and memory-gb must be greater than zero\n";
     std::exit(EXIT_FAILURE);
   }
   return options;
 }
 
-std::vector<std::byte> MakeFlatBufferPayload(uint64_t size, uint64_t seed) {
-  std::vector<std::byte> payload(static_cast<size_t>(size));
-  if (payload.empty()) {
-    return payload;
-  }
+std::string Key(uint64_t index) { return "key-" + std::to_string(index); }
 
-  std::mt19937_64 random(seed);
-  for (std::byte& byte : payload) {
-    byte = static_cast<std::byte>(random() & 0xFF);
-  }
-
-  // The DB treats FlatBuffers as opaque bytes; this marker only makes benchmark
-  // files easy to identify in a hex dump.
-  constexpr std::string_view marker = "LUMO";
-  for (size_t index = 0; index < std::min(marker.size(), payload.size()); ++index) {
-    payload[index] = static_cast<std::byte>(marker[index]);
-  }
-  return payload;
+double Seconds(std::chrono::steady_clock::duration duration) {
+  return std::chrono::duration<double>(duration).count();
 }
 
-std::string FormatSeconds(std::chrono::steady_clock::duration duration) {
-  const double seconds = std::chrono::duration<double>(duration).count();
-  std::ostringstream output;
-  output << std::fixed << std::setprecision(3) << seconds << "s";
-  return output.str();
-}
-
-std::string FormatMicroseconds(std::chrono::steady_clock::duration duration) {
-  const double microseconds =
-      std::chrono::duration<double, std::micro>(duration).count();
-  std::ostringstream output;
-  output << std::fixed << std::setprecision(3) << microseconds << "us";
-  return output.str();
-}
-
-std::string FormatMbPerSecond(uint64_t bytes, std::chrono::steady_clock::duration duration) {
-  const double seconds = std::chrono::duration<double>(duration).count();
-  const double mb = static_cast<double>(bytes) / (1024.0 * 1024.0);
-  std::ostringstream output;
-  output << std::fixed << std::setprecision(2) << (mb / seconds) << " MB/s";
-  return output.str();
-}
-
-std::string FormatMillionKeysPerSecond(
-    uint64_t keyCount, std::chrono::steady_clock::duration duration) {
-  const double seconds = std::chrono::duration<double>(duration).count();
-  std::ostringstream output;
-  output << std::fixed << std::setprecision(2)
-         << (static_cast<double>(keyCount) / seconds / 1'000'000.0)
-         << " Mkeys/s";
-  return output.str();
-}
-
-std::string KeyForIndex(uint64_t index) {
-  return "key-" + std::to_string(index);
-}
-
-std::string_view WritePhaseName(LumoDB::WritePhase phase) {
-  switch (phase) {
-    case LumoDB::WritePhase::kValidating:
-      return "validate";
-    case LumoDB::WritePhase::kResizingIndex:
-      return "resize-index";
-    case LumoDB::WritePhase::kWritingValues:
-      return "write-values";
-    case LumoDB::WritePhase::kPublishingIndex:
-      return "publish-index";
-    case LumoDB::WritePhase::kFlushing:
-      return "flush";
-  }
-  return "unknown";
-}
-
-void PrintReadPercentiles(std::vector<std::chrono::steady_clock::duration>& readDurations) {
-  if (readDurations.empty()) {
-    std::cout << '\n';
-    return;
-  }
-  std::sort(readDurations.begin(), readDurations.end());
-  auto percentile = [&](double p) {
-    const size_t offset = static_cast<size_t>(
-        std::min<double>(readDurations.size() - 1, std::floor(readDurations.size() * p)));
-    return readDurations[offset];
-  };
-
-  std::cout << " p50=" << FormatMicroseconds(percentile(0.50))
-            << " p95=" << FormatMicroseconds(percentile(0.95))
-            << " p99=" << FormatMicroseconds(percentile(0.99)) << '\n';
-}
-
-void RunObjectMode(const BenchmarkOptions& options, double sizeGb) {
-  const uint64_t targetBytes =
-      static_cast<uint64_t>(std::ceil(sizeGb * 1024.0 * 1024.0 * 1024.0));
-  const uint64_t objectCount = options.objectCount != 0
-                                   ? options.objectCount
-                                   : std::max<uint64_t>(
-                                         1, (targetBytes + options.payloadSize - 1) /
-                                                options.payloadSize);
-  const uint64_t writtenBytes = objectCount * options.payloadSize;
-  const double actualSizeGb =
-      static_cast<double>(writtenBytes) / (1024.0 * 1024.0 * 1024.0);
-
-  std::filesystem::path runDirectory =
-      options.directory /
-      (options.objectCount != 0
-           ? "objects-" + std::to_string(objectCount)
-           : "size-" + std::to_string(static_cast<uint64_t>(sizeGb * 1000)));
-  if (!options.keepData) {
-    std::filesystem::remove_all(runDirectory);
-  }
-  std::filesystem::create_directories(runDirectory);
-
-  LumoDB::DatabaseOptions databaseOptions;
-  databaseOptions.initialBucketCount = options.initialBucketCount != 0
-                                           ? options.initialBucketCount
-                                           : RoundUpPowerOfTwo(static_cast<uint64_t>(
-                                                 objectCount /
-                                                 databaseOptions.maxLoadFactor) +
-                                             1);
-  auto lastProgressTime = std::chrono::steady_clock::time_point{};
-  LumoDB::WritePhase lastProgressPhase = LumoDB::WritePhase::kValidating;
-  bool hasProgressPhase = false;
-  if (options.showProgress) {
-    databaseOptions.writeProgress =
-        [&](const LumoDB::WriteProgress& progress) {
-          const auto now = std::chrono::steady_clock::now();
-          const bool phaseChanged =
-              !hasProgressPhase || progress.phase != lastProgressPhase;
-          const bool intervalElapsed =
-              now - lastProgressTime >= std::chrono::seconds(1);
-          if (!phaseChanged && !intervalElapsed &&
-              progress.completed != progress.total) {
-            return;
-          }
-          const double percent =
-              progress.total == 0
-                  ? 100.0
-                  : 100.0 * static_cast<double>(progress.completed) /
-                        static_cast<double>(progress.total);
-          std::cerr << "phase=" << WritePhaseName(progress.phase)
-                    << " completed=" << progress.completed << '/'
-                    << progress.total << " percent=" << std::fixed
-                    << std::setprecision(1) << percent << "%\n";
-          lastProgressTime = now;
-          lastProgressPhase = progress.phase;
-          hasProgressPhase = true;
-        };
-  }
-
-  LumoDB::Database database;
-  const auto databaseOpenStart = std::chrono::steady_clock::now();
-  LumoDB::Status status = database.Open(runDirectory, databaseOptions);
-  const auto databaseOpenEnd = std::chrono::steady_clock::now();
-  if (!status) {
-    std::cerr << "open failed: " << status.Message() << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-
-  std::chrono::steady_clock::duration prepareDuration{};
-  std::chrono::steady_clock::duration databaseWriteDuration{};
-  const std::vector<std::byte> sharedPayload =
-      options.sharedPayload ? MakeFlatBufferPayload(options.payloadSize, 0)
-                            : std::vector<std::byte>{};
-  auto writeStart = std::chrono::steady_clock::now();
-  for (uint64_t firstObject = 0; firstObject < objectCount;
-       firstObject += options.objectBatchSize) {
-    const uint64_t batchCount =
-        std::min<uint64_t>(options.objectBatchSize, objectCount - firstObject);
-    const auto prepareStart = std::chrono::steady_clock::now();
-    std::vector<std::string> keys;
-    std::vector<std::vector<std::byte>> payloads;
-    std::vector<LumoDB::StructEntry> entries;
-    keys.reserve(static_cast<size_t>(batchCount));
-    if (!options.sharedPayload) {
-      payloads.reserve(static_cast<size_t>(batchCount));
-    }
-    entries.reserve(static_cast<size_t>(batchCount));
-    for (uint64_t offset = 0; offset < batchCount; ++offset) {
-      const uint64_t objectIndex = firstObject + offset;
-      keys.push_back(KeyForIndex(objectIndex));
-      if (options.sharedPayload) {
-        entries.push_back(
-            {.key = keys.back(), .flatBufferBytes = sharedPayload});
-      } else {
-        payloads.push_back(
-            MakeFlatBufferPayload(options.payloadSize, objectIndex));
-        entries.push_back(
-            {.key = keys.back(), .flatBufferBytes = payloads.back()});
-      }
-    }
-    const auto prepareEnd = std::chrono::steady_clock::now();
-    prepareDuration += prepareEnd - prepareStart;
-
-    const auto databaseWriteStart = std::chrono::steady_clock::now();
-    status = database.PutUniqueStructs("StructA", entries);
-    const auto databaseWriteEnd = std::chrono::steady_clock::now();
-    databaseWriteDuration += databaseWriteEnd - databaseWriteStart;
-    if (!status) {
-      std::cerr << "write failed: " << status.Message() << '\n';
-      std::exit(EXIT_FAILURE);
+uint64_t DirectoryBytes(const std::filesystem::path& directory) {
+  uint64_t bytes = 0;
+  std::error_code error;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(directory, error)) {
+    if (entry.is_regular_file(error)) {
+      bytes += entry.file_size(error);
     }
   }
-  const auto closeStart = std::chrono::steady_clock::now();
-  status = database.Close();
-  const auto closeEnd = std::chrono::steady_clock::now();
-  databaseWriteDuration += closeEnd - closeStart;
-  if (!status) {
-    std::cerr << "close failed: " << status.Message() << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-  auto writeEnd = std::chrono::steady_clock::now();
-  const auto databaseOpenDuration = databaseOpenEnd - databaseOpenStart;
-  const auto databaseTotalDuration =
-      databaseOpenDuration + databaseWriteDuration;
-  const auto buildDuration =
-      databaseOpenDuration + (writeEnd - writeStart);
-
-  status = database.OpenReadOnly(runDirectory, databaseOptions);
-  if (!status) {
-    std::cerr << "read-only open failed: " << status.Message() << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-
-  std::mt19937_64 random(42);
-  std::vector<std::chrono::steady_clock::duration> readDurations;
-  readDurations.reserve(static_cast<size_t>(options.readCount));
-  std::vector<std::byte> value;
-
-  for (uint64_t index = 0; index < options.readCount; ++index) {
-    const uint64_t objectIndex = random() % objectCount;
-    auto readStart = std::chrono::steady_clock::now();
-    status = database.GetStruct("StructA", KeyForIndex(objectIndex), value);
-    auto readEnd = std::chrono::steady_clock::now();
-    if (!status) {
-      std::cerr << "read failed: " << status.Message() << '\n';
-      std::exit(EXIT_FAILURE);
-    }
-    readDurations.push_back(readEnd - readStart);
-  }
-
-  std::cout << "mode=object size_gb=" << actualSizeGb << " objects=" << objectCount
-            << " batch_size=" << options.objectBatchSize
-            << " payload=" << options.payloadSize << " bytes"
-            << " shared_payload=" << options.sharedPayload
-            << " write=" << FormatSeconds(writeEnd - writeStart)
-            << " throughput=" << FormatMbPerSecond(writtenBytes, writeEnd - writeStart)
-            << " build=" << FormatSeconds(buildDuration)
-            << " build_throughput="
-            << FormatMbPerSecond(writtenBytes, buildDuration)
-            << " prepare=" << FormatSeconds(prepareDuration)
-            << " db_open=" << FormatSeconds(databaseOpenDuration)
-            << " db_write=" << FormatSeconds(databaseWriteDuration)
-            << " db_total=" << FormatSeconds(databaseTotalDuration)
-            << " db_throughput="
-            << FormatMbPerSecond(writtenBytes, databaseTotalDuration)
-            << " db_key_rate="
-            << FormatMillionKeysPerSecond(objectCount, databaseTotalDuration)
-            << " read_count=" << options.readCount;
-  PrintReadPercentiles(readDurations);
-
-  status = database.Close();
-  if (!status) {
-    std::cerr << "close failed: " << status.Message() << '\n';
-    std::exit(EXIT_FAILURE);
-  }
+  return bytes;
 }
 
-void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
-  const uint64_t targetBytes =
-      static_cast<uint64_t>(std::ceil(sizeGb * 1024.0 * 1024.0 * 1024.0));
-  const uint64_t objectCount =
-      std::max<uint64_t>(1, (targetBytes + options.payloadSize - 1) / options.payloadSize);
-  const uint64_t rowCount =
-      (objectCount + options.rowEntries - 1) / options.rowEntries;
-  const uint64_t writtenBytes = objectCount * options.payloadSize;
-
-  std::filesystem::path runDirectory =
-      options.directory / ("row-size-" +
-                           std::to_string(static_cast<uint64_t>(sizeGb * 1000)));
-  if (!options.keepData) {
-    std::filesystem::remove_all(runDirectory);
-  }
-  std::filesystem::create_directories(runDirectory);
-
-  LumoDB::DatabaseOptions databaseOptions;
-  databaseOptions.initialBucketCount = 16;
-  databaseOptions.initialRowBucketCount =
-      RoundUpPowerOfTwo(
-          static_cast<uint64_t>(rowCount / databaseOptions.maxLoadFactor) + 1);
-  databaseOptions.rowShardCount = options.shards;
-
-  LumoDB::Database database;
-  LumoDB::Status status = database.Open(runDirectory, databaseOptions);
+void Check(const LumoDB::Status& status, std::string_view operation) {
   if (!status) {
-    std::cerr << "open failed: " << status.Message() << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-
-  std::atomic<uint64_t> nextRow{0};
-  std::atomic<uint64_t> prepareNanos{0};
-  std::atomic<uint64_t> databaseWriteNanos{0};
-  std::mutex errorMutex;
-  std::string errorMessage;
-
-  auto writeStart = std::chrono::steady_clock::now();
-  std::vector<std::thread> threads;
-  threads.reserve(options.threads);
-  for (uint32_t threadId = 0; threadId < options.threads; ++threadId) {
-    threads.emplace_back([&]() {
-      while (true) {
-        const uint64_t rowId = nextRow.fetch_add(1, std::memory_order_relaxed);
-        if (rowId >= rowCount) {
-          return;
-        }
-
-        const uint64_t firstObject = rowId * options.rowEntries;
-        const uint64_t rowObjectCount =
-            std::min<uint64_t>(options.rowEntries, objectCount - firstObject);
-
-        std::vector<std::string> keys;
-        std::vector<std::vector<std::byte>> payloads;
-        std::vector<LumoDB::RowStructEntry> entries;
-        const auto prepareStart = std::chrono::steady_clock::now();
-        keys.reserve(static_cast<size_t>(rowObjectCount));
-        payloads.reserve(static_cast<size_t>(rowObjectCount));
-        entries.reserve(static_cast<size_t>(rowObjectCount));
-
-        for (uint64_t entryIndex = 0; entryIndex < rowObjectCount; ++entryIndex) {
-          const uint64_t objectIndex = firstObject + entryIndex;
-          keys.push_back(KeyForIndex(objectIndex));
-          payloads.push_back(MakeFlatBufferPayload(options.payloadSize, objectIndex));
-          entries.push_back({.key = keys.back(), .flatBufferBytes = payloads.back()});
-        }
-        const auto prepareEnd = std::chrono::steady_clock::now();
-        prepareNanos.fetch_add(
-            static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(prepareEnd - prepareStart)
-                    .count()),
-            std::memory_order_relaxed);
-
-        const auto databaseWriteStart = std::chrono::steady_clock::now();
-        LumoDB::Status rowStatus = database.PutRowStructs("StructA", rowId, entries);
-        const auto databaseWriteEnd = std::chrono::steady_clock::now();
-        databaseWriteNanos.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                      databaseWriteEnd - databaseWriteStart)
-                                      .count()),
-            std::memory_order_relaxed);
-        if (!rowStatus) {
-          std::lock_guard<std::mutex> lock(errorMutex);
-          if (errorMessage.empty()) {
-            errorMessage = rowStatus.Message();
-          }
-          return;
-        }
-      }
-    });
-  }
-
-  for (std::thread& thread : threads) {
-    thread.join();
-  }
-
-  if (!errorMessage.empty()) {
-    std::cerr << "write failed: " << errorMessage << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-
-  const auto closeStart = std::chrono::steady_clock::now();
-  status = database.Close();
-  const auto closeEnd = std::chrono::steady_clock::now();
-  if (!status) {
-    std::cerr << "close failed: " << status.Message() << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-  auto writeEnd = std::chrono::steady_clock::now();
-  const auto prepareDuration = std::chrono::nanoseconds(prepareNanos.load(
-      std::memory_order_relaxed));
-  const auto databaseWriteDuration =
-      std::chrono::nanoseconds(databaseWriteNanos.load(std::memory_order_relaxed)) +
-      (closeEnd - closeStart);
-
-  status = database.OpenReadOnly(runDirectory, databaseOptions);
-  if (!status) {
-    std::cerr << "read-only open failed: " << status.Message() << '\n';
-    std::exit(EXIT_FAILURE);
-  }
-
-  std::mt19937_64 random(42);
-  std::vector<std::chrono::steady_clock::duration> readDurations;
-  readDurations.reserve(static_cast<size_t>(options.readCount));
-  std::vector<std::byte> value;
-
-  for (uint64_t index = 0; index < options.readCount; ++index) {
-    const uint64_t objectIndex = random() % objectCount;
-    const uint64_t rowId = objectIndex / options.rowEntries;
-    auto readStart = std::chrono::steady_clock::now();
-    status = database.GetRowStruct("StructA", rowId, KeyForIndex(objectIndex), value);
-    auto readEnd = std::chrono::steady_clock::now();
-    if (!status) {
-      std::cerr << "read failed: " << status.Message() << '\n';
-      std::exit(EXIT_FAILURE);
-    }
-    readDurations.push_back(readEnd - readStart);
-  }
-
-  std::cout << "mode=row-parallel size_gb=" << sizeGb << " objects=" << objectCount
-            << " rows=" << rowCount << " row_entries=" << options.rowEntries
-            << " threads=" << options.threads << " shards=" << options.shards
-            << " payload=" << options.payloadSize << " bytes"
-            << " write=" << FormatSeconds(writeEnd - writeStart)
-            << " throughput=" << FormatMbPerSecond(writtenBytes, writeEnd - writeStart)
-            << " prepare_sum=" << FormatSeconds(prepareDuration)
-            << " db_write_sum=" << FormatSeconds(databaseWriteDuration)
-            << " read_count=" << options.readCount;
-  PrintReadPercentiles(readDurations);
-
-  status = database.Close();
-  if (!status) {
-    std::cerr << "close failed: " << status.Message() << '\n';
+    std::cerr << operation << " failed: " << status.Message() << '\n';
     std::exit(EXIT_FAILURE);
   }
 }
@@ -553,17 +99,78 @@ void RunRowParallelMode(const BenchmarkOptions& options, double sizeGb) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  BenchmarkOptions options = ParseArgs(argc, argv);
-  if (options.mode == BenchmarkMode::kObject && options.objectCount != 0) {
-    RunObjectMode(options, 0);
-    return EXIT_SUCCESS;
+  const Options arguments = ParseOptions(argc, argv);
+  std::filesystem::remove_all(arguments.directory);
+
+  LumoDB::DatabaseOptions options;
+  options.expectedEntryCountPerColumn = arguments.entries;
+  options.averageKeyBytes = 16;
+  options.averageValueBytes = arguments.valueBytes;
+  options.writerThreadCount = arguments.threads;
+  options.rowShardCount = arguments.rowShards;
+  options.memoryBudgetBytes = arguments.memoryBytes;
+
+  LumoDB::Database database;
+  Check(database.Open(arguments.directory, options), "Open");
+  const LumoDB::DatabaseLayout layout = database.Layout();
+  std::cout << "entries=" << arguments.entries << " value_bytes=" << arguments.valueBytes
+            << " threads=" << arguments.threads
+            << " target_entries_per_row=" << layout.targetEntriesPerRow
+            << " routes=" << layout.routeCountPerColumn << " row_shards=" << layout.rowShardCount
+            << " spill_partitions=" << layout.spillPartitionCount << '\n';
+
+  std::vector<std::byte> payload(arguments.valueBytes, std::byte{0x5a});
+  const auto putStart = std::chrono::steady_clock::now();
+  std::vector<std::thread> writers;
+  writers.reserve(arguments.threads);
+  for (uint32_t threadId = 0; threadId < arguments.threads; ++threadId) {
+    writers.emplace_back([&, threadId] {
+      for (uint64_t index = threadId; index < arguments.entries; index += arguments.threads) {
+        Check(database.Put("objects", Key(index), payload), "Put");
+      }
+    });
   }
-  for (double sizeGb : options.sizesGb) {
-    if (options.mode == BenchmarkMode::kRowParallel) {
-      RunRowParallelMode(options, sizeGb);
-    } else {
-      RunObjectMode(options, sizeGb);
+  for (std::thread& writer : writers) {
+    writer.join();
+  }
+  const auto putEnd = std::chrono::steady_clock::now();
+  Check(database.Flush(), "Flush");
+  const auto flushEnd = std::chrono::steady_clock::now();
+  Check(database.Close(), "Close");
+
+  const double putSeconds = Seconds(putEnd - putStart);
+  const double flushSeconds = Seconds(flushEnd - putEnd);
+  std::cout << std::fixed << std::setprecision(3) << "stage=" << putSeconds << "s ("
+            << arguments.entries / putSeconds / 1'000'000.0 << " Mkeys/s) "
+            << "build_flush=" << flushSeconds << "s ("
+            << arguments.entries / flushSeconds / 1'000'000.0 << " Mkeys/s) "
+            << "disk=" << DirectoryBytes(arguments.directory) / (1024.0 * 1024 * 1024) << " GiB\n";
+
+  Check(database.OpenReadOnly(arguments.directory), "OpenReadOnly");
+  std::mt19937_64 random(0x12345678);
+  std::vector<double> latencies;
+  latencies.reserve(arguments.reads);
+  for (uint64_t sample = 0; sample < arguments.reads; ++sample) {
+    const uint64_t index = random() % arguments.entries;
+    std::vector<std::byte> value;
+    const auto start = std::chrono::steady_clock::now();
+    Check(database.Get("objects", Key(index), value), "Get");
+    const auto end = std::chrono::steady_clock::now();
+    if (value != payload) {
+      std::cerr << "read returned the wrong value\n";
+      return EXIT_FAILURE;
     }
+    latencies.push_back(std::chrono::duration<double, std::micro>(end - start).count());
+  }
+  std::sort(latencies.begin(), latencies.end());
+  if (!latencies.empty()) {
+    const size_t p50 = latencies.size() / 2;
+    const size_t p99 = std::min(latencies.size() - 1, latencies.size() * 99 / 100);
+    std::cout << "random_read p50=" << latencies[p50] << "us p99=" << latencies[p99] << "us\n";
+  }
+  Check(database.Close(), "CloseReadOnly");
+  if (!arguments.keep) {
+    std::filesystem::remove_all(arguments.directory);
   }
   return EXIT_SUCCESS;
 }

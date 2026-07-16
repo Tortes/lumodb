@@ -73,12 +73,7 @@ if(LUMODB_BUILD_TESTS)
   endfunction()
 
   add_executable(lumodb_tests
-    tests/kv_test.cpp
-    tests/diagnostics_test.cpp
-    tests/parallel_row_test.cpp
-    tests/rebuild_test.cpp
-    tests/row_storage_test.cpp
-    tests/struct_test.cpp
+    tests/database_test.cpp
   )
   lumodb_configure_gtest(lumodb_tests)
 

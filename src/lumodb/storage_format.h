@@ -9,77 +9,13 @@ namespace LumoDB::detail {
 static_assert(std::endian::native == std::endian::little,
               "LumoDB currently stores fixed headers in little-endian form");
 
-inline constexpr std::array<char, 8> kValueFileMagic = {'L', 'U', 'M', 'V',
-                                                        '0', '0', '0', '2'};
-inline constexpr std::array<char, 8> kLegacyValueFileMagic = {'L', 'U', 'M', 'V',
-                                                              '0', '0', '0', '1'};
-inline constexpr std::array<char, 8> kIndexFileMagic = {'L', 'U', 'M', 'I',
-                                                        '0', '0', '0', '2'};
-inline constexpr std::array<char, 8> kObjectWriteMarkerMagic = {
-    'L', 'U', 'M', 'O', 'T', 'X', 'N', '1'};
-inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R',
-                                                           'V', '0', '0', '1'};
-inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R',
-                                                           'I', '0', '0', '2'};
-inline constexpr uint32_t kStorageVersion = 1;
-inline constexpr uint32_t kRecordMagic = 0x43455256;  // "VREC" little endian.
-inline constexpr uint32_t kRowBlockMagic = 0x424C4F52;  // "ROLB" little endian.
-inline constexpr uint8_t kBucketEmpty = 0;
-inline constexpr uint8_t kBucketFilled = 1;
-inline constexpr uint32_t kRowBucketEmpty = 0;
-inline constexpr uint32_t kRowBucketFilled = 1;
-inline constexpr uint32_t kRowBucketWriting = 2;
-
-struct ValueFileHeader {
-  std::array<char, 8> magic = kValueFileMagic;
-  uint32_t version = kStorageVersion;
-  uint32_t headerSize = sizeof(ValueFileHeader);
-  uint64_t reserved = 0;
-};
-
-struct ValueRecordHeader {
-  uint32_t magic = kRecordMagic;
-  uint16_t version = kStorageVersion;
-  uint16_t headerSize = sizeof(ValueRecordHeader);
-  uint32_t columnSize = 0;
-  uint32_t keySize = 0;
-  uint64_t valueSize = 0;
-};
-
-struct LegacyValueRecordHeader {
-  uint32_t magic = kRecordMagic;
-  uint16_t version = kStorageVersion;
-  uint16_t headerSize = sizeof(LegacyValueRecordHeader);
-  uint64_t sequence = 0;
-  uint64_t columnHash = 0;
-  uint64_t keyHash = 0;
-  uint32_t columnSize = 0;
-  uint32_t keySize = 0;
-  uint64_t valueSize = 0;
-};
-
-struct IndexFileHeader {
-  std::array<char, 8> magic = kIndexFileMagic;
-  uint32_t version = kStorageVersion;
-  uint32_t headerSize = sizeof(IndexFileHeader);
-  uint64_t bucketCount = 0;
-  uint64_t itemCount = 0;
-  uint64_t nextSequence = 1;
-  std::array<uint8_t, 24> reserved = {};
-};
-
-struct IndexBucket {
-  uint64_t hash = 0;
-  uint64_t recordOffset = 0;
-};
-
-struct ObjectWriteMarker {
-  std::array<char, 8> magic = kObjectWriteMarkerMagic;
-  uint32_t version = kStorageVersion;
-  uint32_t headerSize = sizeof(ObjectWriteMarker);
-  uint64_t rollbackOffset = sizeof(ValueFileHeader);
-  uint64_t indexBucketCount = 0;
-};
+inline constexpr uint32_t kStorageVersion = 2;
+inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R', 'V', '0', '0', '2'};
+inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R', 'I', '0', '0', '3'};
+inline constexpr std::array<char, 8> kStageFileMagic = {'L', 'U', 'M', 'S', 'T', '0', '0', '1'};
+inline constexpr uint32_t kRowBlockMagic = 0x32424f52;     // "ROB2".
+inline constexpr uint32_t kStageRecordMagic = 0x31544753;  // "SGT1".
+inline constexpr uint64_t kRoutingSeed = 0x9e3779b97f4a7c15ULL;
 
 struct RowValueFileHeader {
   std::array<char, 8> magic = kRowValueFileMagic;
@@ -94,22 +30,29 @@ struct RowIndexFileHeader {
   uint32_t headerSize = sizeof(RowIndexFileHeader);
   uint64_t bucketCount = 0;
   uint64_t itemCount = 0;
+  uint64_t entryCount = 0;
   uint64_t nextSequence = 1;
+  uint64_t routeCount = 0;
+  uint64_t expectedEntryCountPerColumn = 0;
+  uint64_t routingSeed = kRoutingSeed;
+  uint32_t targetEntriesPerRow = 0;
   uint32_t shardCount = 0;
-  uint32_t reserved32 = 0;
-  std::array<uint8_t, 16> reserved = {};
+  uint32_t spillPartitionCount = 0;
+  uint32_t expectedColumnCount = 1;
+  uint64_t reserved64 = 0;
 };
 
+// The index only points to immutable row blocks. Empty buckets have
+// columnHash == 0; real hashes are normalized to a non-zero value.
 struct RowIndexBucket {
-  uint32_t state = kRowBucketEmpty;
-  uint32_t shardId = 0;
   uint64_t columnHash = 0;
   uint64_t rowId = 0;
   uint64_t blockOffset = 0;
-  uint64_t blockSize = 0;
   uint64_t sequence = 0;
-  uint64_t reserved64 = 0;
-  uint64_t reserved65 = 0;
+  uint32_t blockSize = 0;
+  uint32_t shardId = 0;
+  uint32_t itemCount = 0;
+  uint32_t reserved = 0;
 };
 
 struct RowBlockHeader {
@@ -122,32 +65,51 @@ struct RowBlockHeader {
   uint32_t columnSize = 0;
   uint32_t itemCount = 0;
   uint32_t bucketCount = 0;
+  uint32_t keyBytesSize = 0;
+  uint32_t valueBytesSize = 0;
+  uint32_t blockSize = 0;
   uint32_t reserved32 = 0;
-  uint64_t keyBytesSize = 0;
-  uint64_t valueBytesSize = 0;
-  uint64_t blockSize = 0;
 };
 
+// Compact 24-byte local bucket. keyHash == 0 means empty. All offsets are
+// relative to the row's key/value regions, which keeps the hot lookup table
+// small while allowing row blocks up to 4 GiB.
 struct RowKeyBucket {
-  uint8_t state = kBucketEmpty;
-  std::array<uint8_t, 7> reserved = {};
   uint64_t keyHash = 0;
-  uint64_t keyOffset = 0;
-  uint64_t keySize = 0;
-  uint64_t valueOffset = 0;
-  uint64_t valueSize = 0;
+  uint32_t keyOffset = 0;
+  uint32_t keySize = 0;
+  uint32_t valueOffset = 0;
+  uint32_t valueSize = 0;
 };
 
-static_assert(sizeof(ValueFileHeader) == 24);
-static_assert(sizeof(ValueRecordHeader) == 24);
-static_assert(sizeof(LegacyValueRecordHeader) == 48);
-static_assert(sizeof(IndexFileHeader) == 64);
-static_assert(sizeof(IndexBucket) == 16);
-static_assert(sizeof(ObjectWriteMarker) == 32);
+struct StageFileHeader {
+  std::array<char, 8> magic = kStageFileMagic;
+  uint32_t version = kStorageVersion;
+  uint32_t headerSize = sizeof(StageFileHeader);
+  uint32_t partitionId = 0;
+  uint32_t partitionCount = 0;
+  uint64_t reserved = 0;
+};
+
+struct StageRecordHeader {
+  uint32_t magic = kStageRecordMagic;
+  uint16_t version = kStorageVersion;
+  uint16_t headerSize = sizeof(StageRecordHeader);
+  uint64_t columnHash = 0;
+  uint64_t keyHash = 0;
+  uint64_t routeHash = 0;
+  uint32_t columnSize = 0;
+  uint32_t keySize = 0;
+  uint32_t valueSize = 0;
+  uint32_t reserved = 0;
+};
+
 static_assert(sizeof(RowValueFileHeader) == 24);
-static_assert(sizeof(RowIndexFileHeader) == 64);
-static_assert(sizeof(RowIndexBucket) == 64);
-static_assert(sizeof(RowBlockHeader) == 72);
-static_assert(sizeof(RowKeyBucket) == 48);
+static_assert(sizeof(RowIndexFileHeader) == 96);
+static_assert(sizeof(RowIndexBucket) == 48);
+static_assert(sizeof(RowBlockHeader) == 64);
+static_assert(sizeof(RowKeyBucket) == 24);
+static_assert(sizeof(StageFileHeader) == 32);
+static_assert(sizeof(StageRecordHeader) == 48);
 
 }  // namespace LumoDB::detail

@@ -1,17 +1,14 @@
 #include "lumodb/file.h"
 
-#include <algorithm>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cerrno>
 #include <cstring>
 #include <limits>
 #include <string>
-#include <vector>
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/uio.h>
-#include <unistd.h>
 
 namespace LumoDB::detail {
 namespace {
@@ -22,9 +19,7 @@ std::string ErrnoMessage(std::string_view operation) {
 
 }  // namespace
 
-FileDescriptor::~FileDescriptor() {
-  Reset();
-}
+FileDescriptor::~FileDescriptor() { Reset(); }
 
 FileDescriptor::FileDescriptor(FileDescriptor&& other) noexcept : fd_(other.Release()) {}
 
@@ -48,9 +43,7 @@ void FileDescriptor::Reset(int fd) {
   fd_ = fd;
 }
 
-MappedFile::~MappedFile() {
-  Unmap();
-}
+MappedFile::~MappedFile() { Unmap(); }
 
 MappedFile::MappedFile(MappedFile&& other) noexcept
     : data_(other.data_), size_(other.size_), writable_(other.writable_) {
@@ -126,8 +119,7 @@ Status EnsureDirectory(const std::filesystem::path& directory) {
     return Status::Ok();
   }
   if (!std::filesystem::create_directories(directory, error)) {
-    return Status::IoError("create_directories " + directory.string() + ": " +
-                           error.message());
+    return Status::IoError("create_directories " + directory.string() + ": " + error.message());
   }
   return Status::Ok();
 }
@@ -151,7 +143,7 @@ Status OpenReadOnly(const std::filesystem::path& path, FileDescriptor& fd) {
 }
 
 Status GetFileSize(int fd, uint64_t& size) {
-  struct stat fileStat {};
+  struct stat fileStat{};
   if (fstat(fd, &fileStat) != 0) {
     return Status::IoError(ErrnoMessage("fstat"));
   }
@@ -167,34 +159,6 @@ Status TruncateFile(int fd, uint64_t size) {
     return Status::IoError(ErrnoMessage("ftruncate"));
   }
   return Status::Ok();
-}
-
-Status PreallocateFile(int fd, uint64_t size) {
-  if (size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
-    return Status::InvalidArgument("file size exceeds off_t");
-  }
-#if defined(__APPLE__)
-  fstore_t allocation{};
-  allocation.fst_flags = F_ALLOCATECONTIG;
-  allocation.fst_posmode = F_PEOFPOSMODE;
-  allocation.fst_offset = 0;
-  allocation.fst_length = static_cast<off_t>(size);
-  if (fcntl(fd, F_PREALLOCATE, &allocation) != 0) {
-    allocation.fst_flags = F_ALLOCATEALL;
-    if (fcntl(fd, F_PREALLOCATE, &allocation) != 0) {
-      return Status::IoError(ErrnoMessage("fcntl(F_PREALLOCATE)"));
-    }
-  }
-  return TruncateFile(fd, size);
-#else
-  const int result =
-      posix_fallocate(fd, 0, static_cast<off_t>(size));
-  if (result != 0) {
-    errno = result;
-    return Status::IoError(ErrnoMessage("posix_fallocate"));
-  }
-  return Status::Ok();
-#endif
 }
 
 Status SyncFile(int fd) {
@@ -218,8 +182,7 @@ Status ReadAllAt(int fd, void* data, size_t size, uint64_t offset) {
   size_t remaining = size;
   uint64_t currentOffset = offset;
   while (remaining > 0) {
-    ssize_t readSize =
-        pread(fd, cursor, remaining, static_cast<off_t>(currentOffset));
+    ssize_t readSize = pread(fd, cursor, remaining, static_cast<off_t>(currentOffset));
     if (readSize < 0) {
       if (errno == EINTR) {
         continue;
@@ -241,8 +204,7 @@ Status WriteAllAt(int fd, const void* data, size_t size, uint64_t offset) {
   size_t remaining = size;
   uint64_t currentOffset = offset;
   while (remaining > 0) {
-    ssize_t writeSize =
-        pwrite(fd, cursor, remaining, static_cast<off_t>(currentOffset));
+    ssize_t writeSize = pwrite(fd, cursor, remaining, static_cast<off_t>(currentOffset));
     if (writeSize < 0) {
       if (errno == EINTR) {
         continue;
@@ -255,62 +217,6 @@ Status WriteAllAt(int fd, const void* data, size_t size, uint64_t offset) {
     cursor += writeSize;
     currentOffset += static_cast<uint64_t>(writeSize);
     remaining -= static_cast<size_t>(writeSize);
-  }
-  return Status::Ok();
-}
-
-Status WriteVAllAt(int fd, std::span<const WriteSlice> slices, uint64_t offset) {
-  const long configuredMaxVectors = sysconf(_SC_IOV_MAX);
-  const size_t maxVectors =
-      configuredMaxVectors > 0 ? static_cast<size_t>(configuredMaxVectors) : 16;
-  std::vector<iovec> vectors;
-  vectors.reserve(std::min(slices.size(), maxVectors));
-  size_t sliceIndex = 0;
-  uint64_t currentOffset = offset;
-  while (sliceIndex < slices.size()) {
-    vectors.clear();
-    while (sliceIndex < slices.size() && vectors.size() < maxVectors) {
-      const WriteSlice& slice = slices[sliceIndex++];
-      if (slice.size != 0) {
-        vectors.push_back(
-            {.iov_base = const_cast<void*>(slice.data), .iov_len = slice.size});
-      }
-    }
-    if (vectors.empty()) {
-      continue;
-    }
-
-    size_t vectorIndex = 0;
-    while (vectorIndex < vectors.size()) {
-      const int vectorCount =
-          static_cast<int>(vectors.size() - vectorIndex);
-      const ssize_t writeSize =
-          pwritev(fd, vectors.data() + vectorIndex, vectorCount,
-                  static_cast<off_t>(currentOffset));
-      if (writeSize < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        return Status::IoError(ErrnoMessage("pwritev"));
-      }
-      if (writeSize == 0) {
-        return Status::IoError("pwritev wrote zero bytes");
-      }
-
-      size_t consumed = static_cast<size_t>(writeSize);
-      currentOffset += static_cast<uint64_t>(consumed);
-      while (consumed > 0) {
-        iovec& vector = vectors[vectorIndex];
-        if (consumed < vector.iov_len) {
-          vector.iov_base = static_cast<std::byte*>(vector.iov_base) + consumed;
-          vector.iov_len -= consumed;
-          consumed = 0;
-          break;
-        }
-        consumed -= vector.iov_len;
-        ++vectorIndex;
-      }
-    }
   }
   return Status::Ok();
 }
