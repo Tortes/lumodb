@@ -22,6 +22,7 @@ struct Options {
   uint32_t valueBytes = 16;
   uint32_t threads = std::max<uint32_t>(1, std::thread::hardware_concurrency());
   uint32_t rowShards = 0;
+  uint64_t explicitRows = 0;
   uint64_t memoryBytes = 64ULL * 1024 * 1024 * 1024;
   uint64_t reads = 10'000;
   bool keep = false;
@@ -48,6 +49,8 @@ Options ParseOptions(int argc, char** argv) {
       options.threads = static_cast<uint32_t>(std::stoul(std::string(next())));
     } else if (argument == "--row-shards") {
       options.rowShards = static_cast<uint32_t>(std::stoul(std::string(next())));
+    } else if (argument == "--explicit-rows") {
+      options.explicitRows = std::stoull(std::string(next()));
     } else if (argument == "--memory-gb") {
       options.memoryBytes =
           static_cast<uint64_t>(std::stod(std::string(next())) * 1024 * 1024 * 1024);
@@ -57,7 +60,8 @@ Options ParseOptions(int argc, char** argv) {
       options.keep = true;
     } else if (argument == "--help") {
       std::cout << "lumodb_bench [--dir PATH] [--entries N] [--value-bytes N] "
-                   "[--threads N] [--row-shards N] [--memory-gb N] [--reads N] "
+                   "[--threads N] [--row-shards N] [--explicit-rows N] "
+                   "[--memory-gb N] [--reads N] "
                    "[--keep]\n";
       std::exit(EXIT_SUCCESS);
     } else {
@@ -67,6 +71,10 @@ Options ParseOptions(int argc, char** argv) {
   }
   if (options.entries == 0 || options.threads == 0 || options.memoryBytes == 0) {
     std::cerr << "entries, threads, and memory-gb must be greater than zero\n";
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.explicitRows >= (1ULL << 63)) {
+    std::cerr << "explicit-rows must be smaller than 2^63\n";
     std::exit(EXIT_FAILURE);
   }
   return options;
@@ -106,6 +114,8 @@ int main(int argc, char** argv) {
   options.expectedEntryCountPerColumn = arguments.entries;
   options.averageKeyBytes = 16;
   options.averageValueBytes = arguments.valueBytes;
+  options.expectedExplicitRowCount = arguments.explicitRows;
+  options.expectedExplicitEntryCount = arguments.explicitRows == 0 ? 0 : arguments.entries;
   options.writerThreadCount = arguments.threads;
   options.rowShardCount = arguments.rowShards;
   options.memoryBudgetBytes = arguments.memoryBytes;
@@ -116,7 +126,8 @@ int main(int argc, char** argv) {
   std::cout << "entries=" << arguments.entries << " value_bytes=" << arguments.valueBytes
             << " threads=" << arguments.threads
             << " target_entries_per_row=" << layout.targetEntriesPerRow
-            << " routes=" << layout.routeCountPerColumn << " row_shards=" << layout.rowShardCount
+            << " routes=" << layout.routeCountPerColumn
+            << " explicit_rows=" << arguments.explicitRows << " row_shards=" << layout.rowShardCount
             << " spill_partitions=" << layout.spillPartitionCount << '\n';
 
   std::vector<std::byte> payload(arguments.valueBytes, std::byte{0x5a});
@@ -126,7 +137,11 @@ int main(int argc, char** argv) {
   for (uint32_t threadId = 0; threadId < arguments.threads; ++threadId) {
     writers.emplace_back([&, threadId] {
       for (uint64_t index = threadId; index < arguments.entries; index += arguments.threads) {
-        Check(database.Put("objects", Key(index), payload), "Put");
+        const LumoDB::Status status =
+            arguments.explicitRows == 0
+                ? database.Put("objects", Key(index), payload)
+                : database.Put("objects", index % arguments.explicitRows, Key(index), payload);
+        Check(status, "Put");
       }
     });
   }
@@ -154,7 +169,11 @@ int main(int argc, char** argv) {
     const uint64_t index = random() % arguments.entries;
     std::vector<std::byte> value;
     const auto start = std::chrono::steady_clock::now();
-    Check(database.Get("objects", Key(index), value), "Get");
+    const LumoDB::Status status =
+        arguments.explicitRows == 0
+            ? database.Get("objects", Key(index), value)
+            : database.Get("objects", index % arguments.explicitRows, Key(index), value);
+    Check(status, "Get");
     const auto end = std::chrono::steady_clock::now();
     if (value != payload) {
       std::cerr << "read returned the wrong value\n";

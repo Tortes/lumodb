@@ -19,7 +19,9 @@ namespace {
 LumoDB::DatabaseOptions TestOptions(uint64_t expectedEntries = 10'000) {
   LumoDB::DatabaseOptions options;
   options.expectedEntryCountPerColumn = expectedEntries;
-  options.expectedColumnCount = 2;
+  options.expectedAutomaticColumnCount = 2;
+  options.expectedExplicitRowCount = 64;
+  options.expectedExplicitEntryCount = expectedEntries;
   options.averageKeyBytes = 16;
   options.averageValueBytes = 32;
   options.maxEntriesPerRow = 768;
@@ -45,8 +47,8 @@ TEST(DatabaseTest, PutFlushGetAndPersistedAutomaticLayout) {
   ASSERT_OK(database.Open(directory, options));
 
   const LumoDB::DatabaseLayout layout = database.Layout();
-  EXPECT_GE(layout.routeCountPerColumn, 14);
-  EXPECT_EQ(layout.routeCountPerColumn % layout.spillPartitionCount, 0);
+  EXPECT_EQ(layout.routeCountPerColumn, 16);
+  EXPECT_EQ(layout.expectedExplicitRowCount, 64);
   EXPECT_EQ(layout.targetEntriesPerRow, 768);
   EXPECT_EQ(layout.rowShardCount, 4);
   EXPECT_TRUE(std::has_single_bit(layout.rowIndexBucketCount));
@@ -99,6 +101,47 @@ TEST(DatabaseTest, LastDuplicateWinsWithinAndAcrossFlushes) {
   EXPECT_EQ(value, "untouched");
 }
 
+TEST(DatabaseTest, AutomaticAndExplicitRowsCanCoexist) {
+  const auto directory = LumoDB::test::MakeTestDirectory("mixed-row-routing");
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, TestOptions(1'000)));
+
+  // Different columns may choose different routing modes.
+  ASSERT_OK(database.Put("automatic", "same-key", "auto-value"));
+  ASSERT_OK(database.Put("explicit", 7, "same-key", "row-seven"));
+  ASSERT_OK(database.Put("explicit", 8, "same-key", "row-eight"));
+
+  // Both modes may also share one column/key without colliding.
+  ASSERT_OK(database.Put("mixed", "same-key", "mixed-auto"));
+  ASSERT_OK(database.Put("mixed", 0, "same-key", "mixed-explicit"));
+  ASSERT_OK(database.Flush());
+  EXPECT_EQ(database.EntryCount(), 5);
+
+  std::string value;
+  ASSERT_OK(database.Get("automatic", "same-key", value));
+  EXPECT_EQ(value, "auto-value");
+  ASSERT_OK(database.Get("explicit", 7, "same-key", value));
+  EXPECT_EQ(value, "row-seven");
+  ASSERT_OK(database.Get("explicit", 8, "same-key", value));
+  EXPECT_EQ(value, "row-eight");
+  ASSERT_OK(database.Get("mixed", "same-key", value));
+  EXPECT_EQ(value, "mixed-auto");
+  ASSERT_OK(database.Get("mixed", 0, "same-key", value));
+  EXPECT_EQ(value, "mixed-explicit");
+  EXPECT_EQ(database.Get("explicit", 9, "same-key", value).Code(), LumoDB::StatusCode::kNotFound);
+
+  ASSERT_OK(database.Put("explicit", 7, "same-key", "row-seven-updated"));
+  ASSERT_OK(database.Flush());
+  EXPECT_EQ(database.EntryCount(), 5);
+  ASSERT_OK(database.Get("explicit", 7, "same-key", value));
+  EXPECT_EQ(value, "row-seven-updated");
+
+  ASSERT_OK(database.Close());
+  ASSERT_OK(database.OpenReadOnly(directory));
+  ASSERT_OK(database.Get("mixed", 0, "same-key", value));
+  EXPECT_EQ(value, "mixed-explicit");
+}
+
 TEST(DatabaseTest, PutIsThreadSafe) {
   const auto directory = LumoDB::test::MakeTestDirectory("parallel-put");
   constexpr uint32_t kThreads = 8;
@@ -116,7 +159,10 @@ TEST(DatabaseTest, PutIsThreadSafe) {
       for (uint32_t index = threadId; index < kEntryCount; index += kThreads) {
         const std::string key = "key-" + std::to_string(index);
         const std::string value = "value-" + std::to_string(index);
-        if (!database.Put("parallel", key, value)) {
+        const LumoDB::Status status =
+            index % 2 == 0 ? database.Put("automatic-parallel", key, value)
+                           : database.Put("explicit-parallel", index % 64, key, value);
+        if (!status) {
           failed.store(true, std::memory_order_relaxed);
           return;
         }
@@ -132,7 +178,12 @@ TEST(DatabaseTest, PutIsThreadSafe) {
 
   for (uint32_t index : {0U, 1U, 19'999U, 39'999U}) {
     std::string value;
-    ASSERT_OK(database.Get("parallel", "key-" + std::to_string(index), value));
+    if (index % 2 == 0) {
+      ASSERT_OK(database.Get("automatic-parallel", "key-" + std::to_string(index), value));
+    } else {
+      ASSERT_OK(
+          database.Get("explicit-parallel", index % 64, "key-" + std::to_string(index), value));
+    }
     EXPECT_EQ(value, "value-" + std::to_string(index));
   }
 }
@@ -140,7 +191,8 @@ TEST(DatabaseTest, PutIsThreadSafe) {
 TEST(DatabaseTest, RowIndexGrowsWhenColumnEstimateIsExceeded) {
   const auto directory = LumoDB::test::MakeTestDirectory("index-growth");
   LumoDB::DatabaseOptions options = TestOptions(1'000);
-  options.expectedColumnCount = 1;
+  options.expectedAutomaticColumnCount = 1;
+  options.expectedExplicitRowCount = 0;
   options.maxEntriesPerRow = 768;
   LumoDB::Database database;
   ASSERT_OK(database.Open(directory, options));
@@ -216,6 +268,8 @@ TEST(DatabaseTest, ReportsInvalidStateAndArguments) {
   ASSERT_OK(database.Open(directory, TestOptions(100)));
   EXPECT_EQ(database.Put("", "key", "value").Code(), LumoDB::StatusCode::kInvalidArgument);
   EXPECT_EQ(database.Put("column", "", "value").Code(), LumoDB::StatusCode::kInvalidArgument);
+  EXPECT_EQ(database.Put("column", 1ULL << 63, "key", "value").Code(),
+            LumoDB::StatusCode::kInvalidArgument);
   EXPECT_EQ(database.Get("column", "missing", value).Code(), LumoDB::StatusCode::kNotFound);
 }
 

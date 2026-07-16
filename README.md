@@ -1,20 +1,23 @@
 # LumoDB
 
 LumoDB is an immutable-row key/value store for compiler and build outputs. The
-public data API is intentionally one path:
+public data API supports automatic and caller-selected row routing:
 
 ```cpp
-Put(column, key, value);
+Put(column, key, value);         // Automatic row.
+Put(column, rowId, key, value);  // Explicit row.
 Flush();
 Get(column, key, value);
+Get(column, rowId, key, value);
 ```
 
-Callers do not choose a row ID or a hash bucket count. They provide the expected
-number of entries in the largest column when creating a database, and LumoDB
-persists an automatically selected routing layout. The same layout is used by
-all later writable and read-only opens.
+Automatic columns provide their expected scale and let LumoDB choose a stable
+row count. Explicit columns supply row IDs directly. Both modes share the same
+sequential write and compact read engine, can be selected independently per
+column, and may even coexist within one column without collisions. Callers never
+choose a hash bucket count.
 
-The old object, `PutUniqueStructs`, `PutStructs`, and explicit-row APIs are not
+The old object, `PutUniqueStructs`, `PutStructs`, and `PutRowStructs` APIs are not
 part of this format.
 
 ## Creating and reading a database
@@ -24,7 +27,9 @@ part of this format.
 
 LumoDB::DatabaseOptions options;
 options.expectedEntryCountPerColumn = 1'000'000'000ULL;
-options.expectedColumnCount = 1;
+options.expectedAutomaticColumnCount = 1;
+options.expectedExplicitRowCount = 64;
+options.expectedExplicitEntryCount = 10'000'000ULL;
 options.averageKeyBytes = 16;
 options.averageValueBytes = 256;
 options.writerThreadCount = 16;       // 0 = hardware concurrency
@@ -38,10 +43,12 @@ if (!status) {
 }
 
 db.Put("symbols", "name", "encoded-value");
+db.Put("syntax", 42, "node-name", "encoded-node");
 db.Flush();
 
 std::string value;
 db.Get("symbols", "name", value);
+db.Get("syntax", 42, "node-name", value);
 db.Close();
 
 // Routing options are stored in row_index.lumori.
@@ -50,7 +57,11 @@ db.Get("symbols", "name", value);
 ```
 
 Binary values use `std::span<const std::byte>` and
-`std::vector<std::byte>` overloads.
+`std::vector<std::byte>` overloads. Explicit row IDs must be smaller than
+`2^63`; `expectedExplicitRowCount` is the expected total number of explicit
+rows across all columns and pre-sizes the outer index. The optional
+`expectedExplicitEntryCount` helps choose spill parallelism for explicit-heavy
+builds.
 
 `Put` is safe to call concurrently. `Flush`, `Close`, and `Get` must not race
 with Put calls. A batch becomes readable and durable at `Flush`; `Get` returns
@@ -63,10 +74,11 @@ For a new database, LumoDB chooses:
 
 1. A target entry count from `targetRowBytes`, average key/value sizes, and
    `maxEntriesPerRow`.
-2. `routeCountPerColumn = ceil(expected entries / target entries)`, rounded only
-   enough to align spill partitions.
-3. The outer row-index bucket count from the maximum expected number of rows and
-   `maxLoadFactor`.
+2. `routeCountPerColumn` from the expected entries and a four-standard-deviation
+   distribution margin, so hash variance does not frequently double a local
+   bucket table.
+3. The outer row-index bucket count from automatic routes plus
+   `expectedExplicitRowCount` and `maxLoadFactor`.
 4. Sequential spill partitions and row-value shards from the expected byte
    volume, writer count, and memory budget.
 
@@ -80,7 +92,7 @@ large values. Typical results with the default 64 MiB target are approximately:
 | 16 KiB | 3,072 |
 | 64 KiB | 768 |
 
-For one billion small keys, the default target produces about 81,400 routes per
+For one billion small keys, the default target produces about 84,400 routes per
 column and a 131,072-bucket outer index. Underestimating the entry count does not
 make the outer index hang: it can grow during Flush. It can, however, make each
 local row larger; one compact row is limited to 4 GiB, so the scale estimate
@@ -90,14 +102,14 @@ Use `Database::Layout()` after Open to inspect the persisted choice.
 
 ## Write path
 
-Each `Put(column, key, value)` hashes the key once and copies a compact record
-into a mutex-protected, memory-bounded spill-partition buffer. Full buffers are
-written sequentially. There is no mmap random write per key and no global
-one-bucket-per-key table.
+Each Put resolves either an automatic or explicit row ID, then copies a compact
+record into a mutex-protected, memory-bounded spill-partition buffer. Full
+buffers are written sequentially. There is no mmap random write per key and no
+global one-bucket-per-key table.
 
 At Flush, spill partitions are processed in parallel:
 
-- records are grouped by `(column, automatic row ID)`;
+- records are grouped by `(column, resolved row ID)`;
 - duplicate keys are resolved with last-write-wins semantics;
 - an existing row is merged only when a later batch updates it;
 - each new immutable row block is built contiguously;
@@ -126,7 +138,8 @@ There is deliberately no rollback, transaction replay, or full row-file scan.
 
 Read-only Open mmaps the outer index and row-value shards. A random lookup does:
 
-1. hash `(column, key)` and calculate the persisted row ID;
+1. calculate the automatic row ID, or encode the caller-provided row ID in a
+   separate internal namespace;
 2. probe the compact outer row index;
 3. probe the row's compact local key table;
 4. compare the stored key and copy the value.
@@ -144,8 +157,8 @@ the hot table. Row data itself remains immutable after publication.
 | `stage-NNN.lumost` | temporary sequential spill files; removed after Flush |
 | `build.incomplete` | incomplete compiler-output marker |
 
-The automatic-row format is intentionally incompatible with databases created
-by the former object/unique format. Rebuild those outputs in a fresh directory.
+The row format is intentionally incompatible with databases created by the
+former object/unique format. Rebuild those outputs in a fresh directory.
 
 ## Build and test
 
@@ -155,9 +168,9 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The test suite covers duplicate resolution, updates across Flush calls,
-concurrent Put, index growth, column isolation, read-only mmap access, and
-rejection of interrupted builds.
+The test suite covers automatic/explicit row coexistence, duplicate resolution,
+updates across Flush calls, concurrent Put, index growth, column isolation,
+read-only mmap access, and rejection of interrupted builds.
 
 ## Benchmark
 
@@ -167,10 +180,13 @@ rejection of interrupted builds.
   --value-bytes 16 \
   --threads 16 \
   --row-shards 16 \
+  --explicit-rows 0 \
   --memory-gb 128 \
   --reads 10000 \
   --keep
 ```
 
 The benchmark reports the Put staging rate, parallel row-build/Flush rate,
-resulting disk size, and mmap random-read p50/p99 latency separately.
+resulting disk size, and mmap random-read p50/p99 latency separately. Set
+`--explicit-rows` above zero to benchmark caller-selected row routing; zero uses
+automatic routing.

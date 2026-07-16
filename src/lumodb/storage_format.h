@@ -38,8 +38,8 @@ struct RowIndexFileHeader {
   uint32_t targetEntriesPerRow = 0;
   uint32_t shardCount = 0;
   uint32_t spillPartitionCount = 0;
-  uint32_t expectedColumnCount = 1;
-  uint64_t reserved64 = 0;
+  uint32_t expectedAutomaticColumnCount = 1;
+  uint64_t expectedExplicitRowCount = 0;
 };
 
 // The index only points to immutable row blocks. Empty buckets have
@@ -97,7 +97,7 @@ struct StageRecordHeader {
   uint16_t headerSize = sizeof(StageRecordHeader);
   uint64_t columnHash = 0;
   uint64_t keyHash = 0;
-  uint64_t routeHash = 0;
+  uint64_t rowId = 0;
   uint32_t columnSize = 0;
   uint32_t keySize = 0;
   uint32_t valueSize = 0;

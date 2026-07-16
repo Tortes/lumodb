@@ -31,10 +31,16 @@ using WriteProgressCallback = std::function<void(const WriteProgress&)>;
 // in the database and are reused on every subsequent read-write or read-only
 // open, so readers never need to repeat these values.
 struct DatabaseOptions {
-  // Expected number of keys in the largest column. This is required when a new
-  // database is created and is used to choose a stable row count.
+  // Expected number of keys in the largest automatically routed column. These
+  // values choose the automatic row count and pre-size the outer row index.
   uint64_t expectedEntryCountPerColumn = 0;
-  uint32_t expectedColumnCount = 1;
+  uint32_t expectedAutomaticColumnCount = 1;
+  // Expected total explicit rows across all columns. The index still grows if
+  // this estimate is exceeded.
+  uint64_t expectedExplicitRowCount = 0;
+  // Expected total entries written through explicit-row Put. This is used to
+  // size temporary spill partitions, not to choose explicit row IDs.
+  uint64_t expectedExplicitEntryCount = 0;
   uint32_t averageKeyBytes = 16;
   uint32_t averageValueBytes = 256;
 
@@ -58,6 +64,7 @@ struct DatabaseOptions {
 
 struct DatabaseLayout {
   uint64_t expectedEntryCountPerColumn = 0;
+  uint64_t expectedExplicitRowCount = 0;
   uint64_t routeCountPerColumn = 0;
   uint32_t targetEntriesPerRow = 0;
   uint32_t rowShardCount = 0;
@@ -86,12 +93,22 @@ class Database {
   // is uncommitted instead of returning stale data.
   Status Flush();
 
-  // The only write/read data path. Put is safe to call concurrently. Flush,
-  // Close, and Get must not race with Put calls from other threads.
+  // Automatic-row writes and reads.
   Status Put(std::string_view column, std::string_view key, std::span<const std::byte> value);
   Status Put(std::string_view column, std::string_view key, std::string_view value);
   Status Get(std::string_view column, std::string_view key, std::vector<std::byte>& value) const;
   Status Get(std::string_view column, std::string_view key, std::string& value) const;
+
+  // Explicit-row writes and reads. Explicit and automatic rows use separate
+  // internal namespaces and may coexist even within the same column. Put is
+  // safe to call concurrently. Flush, Close, and Get must not race with Put.
+  Status Put(std::string_view column, uint64_t rowId, std::string_view key,
+             std::span<const std::byte> value);
+  Status Put(std::string_view column, uint64_t rowId, std::string_view key, std::string_view value);
+  Status Get(std::string_view column, uint64_t rowId, std::string_view key,
+             std::vector<std::byte>& value) const;
+  Status Get(std::string_view column, uint64_t rowId, std::string_view key,
+             std::string& value) const;
 
   [[nodiscard]] bool IsOpen() const;
   [[nodiscard]] bool HasUncommittedWrites() const;

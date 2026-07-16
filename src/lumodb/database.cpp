@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -32,6 +33,7 @@ constexpr uint64_t kMinimumMemoryBudget = 64ULL * 1024 * 1024;
 constexpr uint32_t kMinimumStageBuffer = 4 * 1024;
 constexpr uint32_t kMaximumStageBuffer = 16 * 1024 * 1024;
 constexpr double kRowLoadFactor = 0.75;
+constexpr uint64_t kExplicitRowBit = 1ULL << 63;
 constexpr std::string_view kIncompleteMarkerName = "build.incomplete";
 constexpr std::string_view kIncompleteMarkerTempName = "build.incomplete.tmp";
 
@@ -49,8 +51,6 @@ uint64_t RoundUpPowerOfTwo(uint64_t value, uint64_t minimum = 1) {
   }
   return std::bit_ceil(value);
 }
-
-uint64_t RoundDownPowerOfTwo(uint64_t value) { return value == 0 ? 0 : std::bit_floor(value); }
 
 bool CheckedAdd(uint64_t lhs, uint64_t rhs, uint64_t& result) {
   if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
@@ -73,6 +73,13 @@ uint64_t DivideRoundUp(uint64_t value, uint64_t divisor) {
 }
 
 uint64_t AlignUp8(uint64_t value) { return (value + 7) & ~uint64_t{7}; }
+
+uint32_t RoutingTargetEntries(uint32_t rowCapacity) {
+  const uint32_t standardDeviation =
+      static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<double>(rowCapacity))));
+  const uint32_t distributionHeadroom = standardDeviation * 4;
+  return rowCapacity > distributionHeadroom ? rowCapacity - distributionHeadroom : 1;
+}
 
 std::span<const std::byte> AsBytes(std::string_view value) {
   return {reinterpret_cast<const std::byte*>(value.data()), value.size()};
@@ -149,6 +156,16 @@ class Database::Impl {
   }
 
   Status Put(std::string_view column, std::string_view key, std::span<const std::byte> value) {
+    return PutInternal(column, 0, false, key, value);
+  }
+
+  Status Put(std::string_view column, uint64_t rowId, std::string_view key,
+             std::span<const std::byte> value) {
+    return PutInternal(column, rowId, true, key, value);
+  }
+
+  Status PutInternal(std::string_view column, uint64_t requestedRowId, bool explicitRow,
+                     std::string_view key, std::span<const std::byte> value) {
     std::shared_lock lifecycleLock(lifecycleMutex_);
     if (!open_) {
       return Status::NotOpen("database is not open");
@@ -165,6 +182,9 @@ class Database::Impl {
     if (key.empty()) {
       return Status::InvalidArgument("key must not be empty");
     }
+    if (explicitRow && requestedRowId >= kExplicitRowBit) {
+      return Status::InvalidArgument("explicit rowId must be smaller than 2^63");
+    }
     if (column.size() > std::numeric_limits<uint32_t>::max() ||
         key.size() > std::numeric_limits<uint32_t>::max() ||
         value.size() > std::numeric_limits<uint32_t>::max()) {
@@ -179,15 +199,19 @@ class Database::Impl {
 
     const uint64_t columnHash = NormalizeHash(detail::HashString(column));
     const uint64_t keyHash = NormalizeHash(detail::HashString(key));
-    const uint64_t routeHash =
-        detail::MixHashes(detail::MixHashes(columnHash, keyHash), RoutingSeed());
+    uint64_t rowId = requestedRowId | kExplicitRowBit;
+    if (!explicitRow) {
+      const uint64_t routeHash =
+          detail::MixHashes(detail::MixHashes(columnHash, keyHash), RoutingSeed());
+      rowId = routeHash % routeCount_;
+    }
     const uint32_t partitionId =
-        static_cast<uint32_t>(routeHash % static_cast<uint64_t>(spillPartitions_.size()));
+        static_cast<uint32_t>(detail::MixHashes(columnHash, rowId) % spillPartitions_.size());
 
     detail::StageRecordHeader record;
     record.columnHash = columnHash;
     record.keyHash = keyHash;
-    record.routeHash = routeHash;
+    record.rowId = rowId;
     record.columnSize = static_cast<uint32_t>(column.size());
     record.keySize = static_cast<uint32_t>(key.size());
     record.valueSize = static_cast<uint32_t>(value.size());
@@ -246,6 +270,16 @@ class Database::Impl {
   }
 
   Status Get(std::string_view column, std::string_view key, std::vector<std::byte>& value) const {
+    return GetInternal(column, 0, false, key, value);
+  }
+
+  Status Get(std::string_view column, uint64_t rowId, std::string_view key,
+             std::vector<std::byte>& value) const {
+    return GetInternal(column, rowId, true, key, value);
+  }
+
+  Status GetInternal(std::string_view column, uint64_t requestedRowId, bool explicitRow,
+                     std::string_view key, std::vector<std::byte>& value) const {
     std::shared_lock lifecycleLock(lifecycleMutex_);
     value.clear();
     if (!open_) {
@@ -257,12 +291,18 @@ class Database::Impl {
     if (column.empty() || key.empty()) {
       return Status::InvalidArgument("column and key must not be empty");
     }
+    if (explicitRow && requestedRowId >= kExplicitRowBit) {
+      return Status::InvalidArgument("explicit rowId must be smaller than 2^63");
+    }
 
     const uint64_t columnHash = NormalizeHash(detail::HashString(column));
     const uint64_t keyHash = NormalizeHash(detail::HashString(key));
-    const uint64_t routeHash =
-        detail::MixHashes(detail::MixHashes(columnHash, keyHash), RoutingSeed());
-    const uint64_t rowId = routeHash % routeCount_;
+    uint64_t rowId = requestedRowId | kExplicitRowBit;
+    if (!explicitRow) {
+      const uint64_t routeHash =
+          detail::MixHashes(detail::MixHashes(columnHash, keyHash), RoutingSeed());
+      rowId = routeHash % routeCount_;
+    }
 
     RowLookup lookup;
     Status status = FindRowBucket(column, columnHash, rowId, lookup);
@@ -347,6 +387,7 @@ class Database::Impl {
     }
     const detail::RowIndexFileHeader& header = *IndexHeader();
     layout.expectedEntryCountPerColumn = header.expectedEntryCountPerColumn;
+    layout.expectedExplicitRowCount = header.expectedExplicitRowCount;
     layout.routeCountPerColumn = header.routeCount;
     layout.targetEntriesPerRow = header.targetEntriesPerRow;
     layout.rowShardCount = header.shardCount;
@@ -511,8 +552,8 @@ class Database::Impl {
     if (options_.expectedEntryCountPerColumn == 0) {
       return Status::InvalidArgument("expectedEntryCountPerColumn is required for a new database");
     }
-    if (options_.expectedColumnCount == 0) {
-      return Status::InvalidArgument("expectedColumnCount must be greater than zero");
+    if (options_.expectedAutomaticColumnCount == 0) {
+      return Status::InvalidArgument("expectedAutomaticColumnCount must be greater than zero");
     }
     if (options_.maxEntriesPerRow == 0) {
       return Status::InvalidArgument("maxEntriesPerRow must be greater than zero");
@@ -527,7 +568,10 @@ class Database::Impl {
           "row target is too small for the configured average value size");
     }
     const uint64_t baseRouteCount =
-        DivideRoundUp(options_.expectedEntryCountPerColumn, targetEntries);
+        DivideRoundUp(options_.expectedEntryCountPerColumn, RoutingTargetEntries(targetEntries));
+    if (baseRouteCount >= kExplicitRowBit) {
+      return Status::InvalidArgument("automatic row count exceeds the supported range");
+    }
     const uint32_t writers = ResolvedWriterThreads(options_);
 
     uint32_t spillCount = options_.spillPartitionCount;
@@ -537,8 +581,14 @@ class Database::Impl {
           !CheckedAdd(bytesPerEntry, options_.averageValueBytes, bytesPerEntry)) {
         bytesPerEntry = std::numeric_limits<uint64_t>::max();
       }
+      uint64_t estimatedEntries = 0;
+      if (!CheckedMultiply(options_.expectedEntryCountPerColumn,
+                           options_.expectedAutomaticColumnCount, estimatedEntries) ||
+          !CheckedAdd(estimatedEntries, options_.expectedExplicitEntryCount, estimatedEntries)) {
+        estimatedEntries = std::numeric_limits<uint64_t>::max();
+      }
       uint64_t estimatedBytes = 0;
-      if (!CheckedMultiply(options_.expectedEntryCountPerColumn, bytesPerEntry, estimatedBytes)) {
+      if (!CheckedMultiply(estimatedEntries, bytesPerEntry, estimatedBytes)) {
         estimatedBytes = std::numeric_limits<uint64_t>::max();
       }
       const uint64_t desiredPartitionBytes = std::max<uint64_t>(
@@ -549,14 +599,13 @@ class Database::Impl {
       automatic = std::max<uint64_t>(automatic, std::min<uint64_t>(writers, baseRouteCount));
       automatic = RoundUpPowerOfTwo(automatic);
       automatic = std::min<uint64_t>(automatic, kMaximumSpillPartitions);
-      automatic =
-          std::min<uint64_t>(automatic, std::max<uint64_t>(1, RoundDownPowerOfTwo(baseRouteCount)));
       spillCount = static_cast<uint32_t>(std::max<uint64_t>(1, automatic));
     }
 
-    const uint64_t routeCount = DivideRoundUp(baseRouteCount, spillCount) * spillCount;
+    const uint64_t routeCount = baseRouteCount;
     uint64_t expectedRows = 0;
-    if (!CheckedMultiply(routeCount, options_.expectedColumnCount, expectedRows)) {
+    if (!CheckedMultiply(routeCount, options_.expectedAutomaticColumnCount, expectedRows) ||
+        !CheckedAdd(expectedRows, options_.expectedExplicitRowCount, expectedRows)) {
       return Status::InvalidArgument("configured row count overflows uint64");
     }
     const long double bucketsNeeded =
@@ -582,7 +631,8 @@ class Database::Impl {
     header.targetEntriesPerRow = targetEntries;
     header.shardCount = shardCount;
     header.spillPartitionCount = spillCount;
-    header.expectedColumnCount = options_.expectedColumnCount;
+    header.expectedAutomaticColumnCount = options_.expectedAutomaticColumnCount;
+    header.expectedExplicitRowCount = options_.expectedExplicitRowCount;
     return Status::Ok();
   }
 
@@ -662,11 +712,11 @@ class Database::Impl {
     }
     if (!std::has_single_bit(header.bucketCount) || header.bucketCount < kMinimumIndexBucketCount ||
         header.itemCount > header.bucketCount || header.routeCount == 0 ||
-        header.targetEntriesPerRow == 0 || header.shardCount == 0 ||
-        header.shardCount > kMaximumRowShards || header.spillPartitionCount == 0 ||
-        header.spillPartitionCount > kMaximumSpillPartitions ||
-        !std::has_single_bit(header.spillPartitionCount) ||
-        header.routeCount % header.spillPartitionCount != 0 || header.routingSeed == 0) {
+        header.targetEntriesPerRow == 0 || header.expectedAutomaticColumnCount == 0 ||
+        header.shardCount == 0 || header.shardCount > kMaximumRowShards ||
+        header.spillPartitionCount == 0 || header.spillPartitionCount > kMaximumSpillPartitions ||
+        !std::has_single_bit(header.spillPartitionCount) || header.routeCount >= kExplicitRowBit ||
+        header.routingSeed == 0) {
       return Status::Corruption("row index header contains invalid routing data");
     }
     uint64_t bucketBytes = 0;
@@ -1040,9 +1090,21 @@ class Database::Impl {
 
     std::unordered_map<StageGroupKey, size_t, StageGroupKeyHash> groupIndexes;
     std::vector<StageGroup> groups;
-    const uint64_t approximateGroups =
-        DivideRoundUp(routeCount_, spillPartitions_.size()) * expectedColumnCount_;
-    if (approximateGroups <= std::numeric_limits<size_t>::max()) {
+    uint64_t approximateGroups = 0;
+    uint64_t approximateAutomaticGroups = 0;
+    const uint64_t explicitGroups =
+        DivideRoundUp(expectedExplicitRowCount_, spillPartitions_.size());
+    const bool groupEstimateValid =
+        CheckedMultiply(DivideRoundUp(routeCount_, spillPartitions_.size()),
+                        expectedAutomaticColumnCount_, approximateAutomaticGroups) &&
+        CheckedAdd(approximateAutomaticGroups, explicitGroups, approximateGroups);
+    const uint64_t maximumGroupsInFile =
+        (partition.persistedSize - sizeof(detail::StageFileHeader)) /
+        sizeof(detail::StageRecordHeader);
+    if (groupEstimateValid) {
+      approximateGroups = std::min(approximateGroups, maximumGroupsInFile);
+    }
+    if (groupEstimateValid && approximateGroups <= std::numeric_limits<size_t>::max()) {
       groupIndexes.reserve(static_cast<size_t>(approximateGroups));
       groups.reserve(static_cast<size_t>(approximateGroups));
     }
@@ -1065,7 +1127,8 @@ class Database::Impl {
           recordSize > partition.persistedSize - offset) {
         return Status::Corruption("stage record extends beyond its file");
       }
-      if (record.routeHash % spillPartitions_.size() != partitionId) {
+      if (detail::MixHashes(record.columnHash, record.rowId) % spillPartitions_.size() !=
+          partitionId) {
         return Status::Corruption("stage record is in the wrong partition");
       }
 
@@ -1074,7 +1137,7 @@ class Database::Impl {
       const std::byte* valueData = reinterpret_cast<const std::byte*>(keyData + record.keySize);
       const std::string_view column(columnData, record.columnSize);
       const std::string_view key(keyData, record.keySize);
-      const uint64_t rowId = record.routeHash % routeCount_;
+      const uint64_t rowId = record.rowId;
       const StageGroupKey groupKey{record.columnHash, rowId, column};
       auto [iterator, inserted] = groupIndexes.emplace(groupKey, groups.size());
       if (inserted) {
@@ -1146,10 +1209,7 @@ class Database::Impl {
     bucket.blockSize = static_cast<uint32_t>(block.size());
     bucket.shardId = shardId;
     bucket.itemCount = itemCount;
-    status = PublishRowBucket(group.column, bucket);
-    if (status) {
-    }
-    return status;
+    return PublishRowBucket(group.column, bucket);
   }
 
   Status LoadExistingRow(std::string_view column, uint64_t columnHash, uint64_t rowId,
@@ -1562,7 +1622,8 @@ class Database::Impl {
     const detail::RowIndexFileHeader& header = *IndexHeader();
     routeCount_ = header.routeCount;
     routingSeed_ = header.routingSeed;
-    expectedColumnCount_ = header.expectedColumnCount;
+    expectedAutomaticColumnCount_ = header.expectedAutomaticColumnCount;
+    expectedExplicitRowCount_ = header.expectedExplicitRowCount;
     shardCount_ = header.shardCount;
     spillPartitionCount_ = header.spillPartitionCount;
   }
@@ -1596,7 +1657,8 @@ class Database::Impl {
     writePoisoned_.store(false, std::memory_order_relaxed);
     routeCount_ = 0;
     routingSeed_ = detail::kRoutingSeed;
-    expectedColumnCount_ = 1;
+    expectedAutomaticColumnCount_ = 1;
+    expectedExplicitRowCount_ = 0;
     shardCount_ = 0;
     spillPartitionCount_ = 0;
   }
@@ -1619,7 +1681,8 @@ class Database::Impl {
   std::atomic<bool> writePoisoned_{false};
   uint64_t routeCount_ = 0;
   uint64_t routingSeed_ = detail::kRoutingSeed;
-  uint32_t expectedColumnCount_ = 1;
+  uint32_t expectedAutomaticColumnCount_ = 1;
+  uint64_t expectedExplicitRowCount_ = 0;
   uint32_t shardCount_ = 0;
   uint32_t spillPartitionCount_ = 0;
   bool open_ = false;
@@ -1670,6 +1733,17 @@ Status Database::Put(std::string_view column, std::string_view key, std::string_
   return Put(column, key, AsBytes(value));
 }
 
+Status Database::Put(std::string_view column, uint64_t rowId, std::string_view key,
+                     std::span<const std::byte> value) {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->Put(column, rowId, key, value);
+}
+
+Status Database::Put(std::string_view column, uint64_t rowId, std::string_view key,
+                     std::string_view value) {
+  return Put(column, rowId, key, AsBytes(value));
+}
+
 Status Database::Get(std::string_view column, std::string_view key,
                      std::vector<std::byte>& value) const {
   return impl_ == nullptr ? Status::NotOpen("database is not open")
@@ -1679,6 +1753,23 @@ Status Database::Get(std::string_view column, std::string_view key,
 Status Database::Get(std::string_view column, std::string_view key, std::string& value) const {
   std::vector<std::byte> bytes;
   Status status = Get(column, key, bytes);
+  if (!status) {
+    return status;
+  }
+  value.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  return Status::Ok();
+}
+
+Status Database::Get(std::string_view column, uint64_t rowId, std::string_view key,
+                     std::vector<std::byte>& value) const {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->Get(column, rowId, key, value);
+}
+
+Status Database::Get(std::string_view column, uint64_t rowId, std::string_view key,
+                     std::string& value) const {
+  std::vector<std::byte> bytes;
+  Status status = Get(column, rowId, key, bytes);
   if (!status) {
     return status;
   }
