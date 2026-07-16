@@ -1,6 +1,7 @@
 #include <atomic>
 #include <bit>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -99,6 +100,28 @@ TEST(DatabaseTest, LastDuplicateWinsWithinAndAcrossFlushes) {
   EXPECT_EQ(value, "third");
   ASSERT_OK(database.Get("column", "other", value));
   EXPECT_EQ(value, "untouched");
+}
+
+TEST(DatabaseTest, DuplicateHeavyBatchSizesRowFromUniqueKeys) {
+  const auto directory = LumoDB::test::MakeTestDirectory("duplicate-heavy");
+  constexpr uint32_t kDuplicateCount = 20'000;
+  LumoDB::DatabaseOptions options = TestOptions(kDuplicateCount);
+  options.writerThreadCount = 1;
+  options.rowShardCount = 1;
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+  for (uint32_t index = 0; index < kDuplicateCount; ++index) {
+    ASSERT_OK(database.Put("column", "key", "value-" + std::to_string(index)));
+  }
+  ASSERT_OK(database.Flush());
+
+  EXPECT_EQ(database.EntryCount(), 1);
+  EXPECT_EQ(database.RowCount(), 1);
+  std::string value;
+  ASSERT_OK(database.Get("column", "key", value));
+  EXPECT_EQ(value, "value-19999");
+  EXPECT_LT(std::filesystem::file_size(directory / "row_values-000.lumorv"), 64ULL * 1024);
 }
 
 TEST(DatabaseTest, AutomaticAndExplicitRowsCanCoexist) {
@@ -271,6 +294,14 @@ TEST(DatabaseTest, ReportsInvalidStateAndArguments) {
   EXPECT_EQ(database.Put("column", 1ULL << 63, "key", "value").Code(),
             LumoDB::StatusCode::kInvalidArgument);
   EXPECT_EQ(database.Get("column", "missing", value).Code(), LumoDB::StatusCode::kNotFound);
+
+  LumoDB::DatabaseOptions nonFiniteOptions = TestOptions(100);
+  nonFiniteOptions.maxLoadFactor = std::numeric_limits<double>::quiet_NaN();
+  LumoDB::Database nonFiniteDatabase;
+  EXPECT_EQ(nonFiniteDatabase
+                .Open(LumoDB::test::MakeTestDirectory("non-finite-load-factor"), nonFiniteOptions)
+                .Code(),
+            LumoDB::StatusCode::kInvalidArgument);
 }
 
 }  // namespace

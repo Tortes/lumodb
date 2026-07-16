@@ -32,6 +32,7 @@ constexpr uint32_t kMaximumSpillPartitions = 128;
 constexpr uint64_t kMinimumMemoryBudget = 64ULL * 1024 * 1024;
 constexpr uint32_t kMinimumStageBuffer = 4 * 1024;
 constexpr uint32_t kMaximumStageBuffer = 16 * 1024 * 1024;
+constexpr uint32_t kMaximumDedupPresizeEntries = 64 * 1024;
 constexpr double kRowLoadFactor = 0.75;
 constexpr uint64_t kExplicitRowBit = 1ULL << 63;
 constexpr std::string_view kIncompleteMarkerName = "build.incomplete";
@@ -455,7 +456,7 @@ class Database::Impl {
 
   struct TemporaryKeySlot {
     uint64_t keyHash = 0;
-    uint32_t entryIndex = 0;
+    size_t entryIndex = 0;
   };
 
   Status OpenInternal(const std::filesystem::path& directory, const DatabaseOptions& options,
@@ -542,7 +543,8 @@ class Database::Impl {
         options.stageBufferBytes > kMaximumStageBuffer) {
       return Status::InvalidArgument("stageBufferBytes must be between 4 KiB and 16 MiB");
     }
-    if (options.maxLoadFactor <= 0.50 || options.maxLoadFactor >= 0.95) {
+    if (!std::isfinite(options.maxLoadFactor) || options.maxLoadFactor <= 0.50 ||
+        options.maxLoadFactor >= 0.95) {
       return Status::InvalidArgument("maxLoadFactor must be in (0.50, 0.95)");
     }
     return Status::Ok();
@@ -1277,14 +1279,107 @@ class Database::Impl {
   Status BuildRowBlock(std::string_view column, uint64_t columnHash, uint64_t rowId,
                        uint64_t sequence, std::span<const EntryView> entries,
                        std::vector<std::byte>& block, uint32_t& itemCount) const {
-    if (entries.empty() || entries.size() > std::numeric_limits<uint32_t>::max()) {
+    if (entries.empty()) {
       return Status::InvalidArgument("row has an unsupported number of entries");
     }
-    const uint64_t requiredBuckets =
-        static_cast<uint64_t>(static_cast<long double>(entries.size()) / kRowLoadFactor) + 1;
-    const uint64_t bucketCount64 = RoundUpPowerOfTwo(requiredBuckets, 2);
-    if (bucketCount64 == 0 || bucketCount64 > std::numeric_limits<uint32_t>::max()) {
+
+    // Grow according to the number of unique keys, not the number of staged
+    // records. Duplicate writes only replace an entry index and therefore do
+    // not inflate either the temporary table or the persisted row table.
+    auto bucketCountForEntries = [](uint64_t entryCount) {
+      const uint64_t requiredBuckets =
+          static_cast<uint64_t>(static_cast<long double>(entryCount) / kRowLoadFactor) + 1;
+      return RoundUpPowerOfTwo(requiredBuckets, 2);
+    };
+    const uint64_t initialEntryEstimate =
+        std::min<uint64_t>({entries.size(), kMaximumDedupPresizeEntries,
+                            RoutingTargetEntries(IndexHeader()->targetEntriesPerRow)});
+    const uint64_t initialBucketCount = bucketCountForEntries(initialEntryEstimate);
+    if (initialBucketCount == 0 || initialBucketCount > std::numeric_limits<uint32_t>::max()) {
       return Status::InvalidArgument("row local index is too large");
+    }
+
+    std::vector<TemporaryKeySlot> temporary(static_cast<size_t>(initialBucketCount));
+    auto rehashTemporaryTable = [&](uint64_t newBucketCount) -> Status {
+      if (newBucketCount == 0 || newBucketCount > std::numeric_limits<uint32_t>::max() ||
+          newBucketCount > std::numeric_limits<size_t>::max()) {
+        return Status::InvalidArgument("row local index is too large");
+      }
+      if (newBucketCount == temporary.size()) {
+        return Status::Ok();
+      }
+      std::vector<TemporaryKeySlot> rehashed(static_cast<size_t>(newBucketCount));
+      const size_t mask = rehashed.size() - 1;
+      for (const TemporaryKeySlot& source : temporary) {
+        if (source.keyHash == 0) {
+          continue;
+        }
+        const size_t start = static_cast<size_t>(source.keyHash) & mask;
+        bool placed = false;
+        for (size_t probe = 0; probe < rehashed.size(); ++probe) {
+          TemporaryKeySlot& target = rehashed[(start + probe) & mask];
+          if (target.keyHash == 0) {
+            target = source;
+            placed = true;
+            break;
+          }
+        }
+        if (!placed) {
+          return Status::Corruption("row local index is unexpectedly full during rehash");
+        }
+      }
+      temporary = std::move(rehashed);
+      return Status::Ok();
+    };
+
+    uint32_t uniqueCount = 0;
+    for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+      const EntryView& entry = entries[entryIndex];
+      const uint64_t keyHash = NormalizeHash(entry.keyHash);
+      for (;;) {
+        const size_t mask = temporary.size() - 1;
+        const size_t start = static_cast<size_t>(keyHash) & mask;
+        size_t emptyIndex = temporary.size();
+        bool replaced = false;
+        for (size_t probe = 0; probe < temporary.size(); ++probe) {
+          const size_t slotIndex = (start + probe) & mask;
+          TemporaryKeySlot& slot = temporary[slotIndex];
+          if (slot.keyHash == 0) {
+            emptyIndex = slotIndex;
+            break;
+          }
+          if (slot.keyHash == keyHash && entries[slot.entryIndex].key == entry.key) {
+            slot.entryIndex = entryIndex;
+            replaced = true;
+            break;
+          }
+        }
+        if (replaced) {
+          break;
+        }
+        if (emptyIndex == temporary.size()) {
+          return Status::Corruption("row local index is unexpectedly full");
+        }
+
+        const uint64_t nextUniqueCount = static_cast<uint64_t>(uniqueCount) + 1;
+        if (nextUniqueCount * 4 >= static_cast<uint64_t>(temporary.size()) * 3) {
+          Status status = rehashTemporaryTable(static_cast<uint64_t>(temporary.size()) * 2);
+          if (!status) {
+            return status;
+          }
+          continue;
+        }
+        temporary[emptyIndex].keyHash = keyHash;
+        temporary[emptyIndex].entryIndex = entryIndex;
+        ++uniqueCount;
+        break;
+      }
+    }
+
+    const uint64_t bucketCount64 = bucketCountForEntries(uniqueCount);
+    Status status = rehashTemporaryTable(bucketCount64);
+    if (!status) {
+      return status;
     }
     uint64_t minimumBlockSize = AlignUp8(sizeof(detail::RowBlockHeader) + column.size());
     uint64_t minimumBucketBytes = 0;
@@ -1296,32 +1391,6 @@ class Database::Impl {
           "expectedEntryCountPerColumn");
     }
     const uint32_t bucketCount = static_cast<uint32_t>(bucketCount64);
-    std::vector<TemporaryKeySlot> temporary(bucketCount);
-    uint32_t uniqueCount = 0;
-    for (uint32_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
-      const EntryView& entry = entries[entryIndex];
-      const uint64_t keyHash = NormalizeHash(entry.keyHash);
-      const uint64_t start = keyHash & (bucketCount - 1);
-      bool placed = false;
-      for (uint64_t probe = 0; probe < bucketCount; ++probe) {
-        TemporaryKeySlot& slot = temporary[(start + probe) & (bucketCount - 1)];
-        if (slot.keyHash == 0) {
-          slot.keyHash = keyHash;
-          slot.entryIndex = entryIndex;
-          ++uniqueCount;
-          placed = true;
-          break;
-        }
-        if (slot.keyHash == keyHash && entries[slot.entryIndex].key == entry.key) {
-          slot.entryIndex = entryIndex;
-          placed = true;
-          break;
-        }
-      }
-      if (!placed) {
-        return Status::Corruption("row local index is unexpectedly full");
-      }
-    }
 
     uint64_t keyBytesSize = 0;
     uint64_t valueBytesSize = 0;
