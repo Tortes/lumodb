@@ -167,6 +167,38 @@ data that is written exactly once. The caller must ensure that every
 db.PutUniqueStructs("StructA", entries);
 ```
 
+For peak immutable-ingest throughput, size the object index once and submit the
+input as one large batch instead of calling the API once per key:
+
+```cpp
+LumoDB::DatabaseOptions options;
+options.initialBucketCount =
+    static_cast<uint64_t>(expectedKeyCount / options.maxLoadFactor) + 1;
+options.writeProgress = [](const LumoDB::WriteProgress& progress) {
+  // Forward coarse validate/resize/value/index/flush progress to your logger.
+};
+db.Open("/tmp/lumodb", options);
+
+// The API keeps its internal memory bounded even if entries contains millions
+// of key/value pairs.
+db.PutUniqueStructs("StructA", entries);
+```
+
+The unique path combines records up to 4 KiB into multi-megabyte sequential
+writes. Larger records use bounded `pwritev` batches, and index entries are
+published in fixed-size chunks only after all values have been appended. Index
+growth physically reserves the final file before mmap stores begin, without
+dirtying every empty bucket page up front. This prevents a sparse mmap from
+failing later with `SIGBUS` when the filesystem runs out of space. These
+optimizations keep database-owned batch metadata to a few MiB and do not change
+the final on-disk index layout or point-read path.
+
+An object-write marker stays present until `Flush` or `Close` has persisted both
+the value and index files. If the process stops first, the next read-write open
+rolls the uncommitted object tail back and rebuilds the index; a read-only open
+refuses the database until that recovery has run. Avoid `Flush` between batches;
+call it only at a durability boundary, or let `Close` perform the final sync.
+
 ### Row API
 
 ```cpp
@@ -290,12 +322,28 @@ ctest --test-dir build -R LumoDBSystemTest --output-on-failure
 Object benchmark:
 
 ```bash
-./build/lumodb_bench --dir /tmp/lumodb-bench --sizes 1,5,10 --read-count 100
+./build/lumodb_bench --dir /tmp/lumodb-bench --sizes 1,5,10 \
+  --object-batch-size 4096 --read-count 100
 ```
 
-Use `--object-batch-size 256` to measure batched immutable object writes. The
+Use `--object-batch-size` to compare immutable-object batch sizes. The
 benchmark reports payload preparation separately from database write and close
 time, then measures point reads after an `OpenReadOnly` reopen.
+
+To reproduce a single call containing ten million entries while avoiding ten
+million benchmark-only value allocations:
+
+```bash
+./build/lumodb_bench --dir /tmp/lumodb-bench --object-count 10000000 \
+  --object-batch-size 10000000 --payload-size 16 --shared-payload \
+  --initial-bucket-count 16777216 --progress --read-count 100
+```
+
+`--progress` prints the active validate, resize, value-write, index-publish, or
+flush phase at most once per second, plus phase boundaries. The close/flush time
+is included in `db_write`; `db_total` and `db_key_rate` additionally include
+`Open` and index preallocation, so they represent the complete database build
+rather than only page-cache ingest throughput.
 
 Parallel row benchmark:
 
