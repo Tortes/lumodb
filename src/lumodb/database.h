@@ -32,6 +32,11 @@ struct RowStructEntry {
   std::span<const std::byte> flatBufferBytes;
 };
 
+struct StructEntry {
+  std::string_view key;
+  std::span<const std::byte> flatBufferBytes;
+};
+
 // Options used when a database is first created. Routing parameters are stored
 // in the database and are reused on every subsequent read-write or read-only
 // open, so readers never need to repeat these values.
@@ -101,6 +106,10 @@ class Database {
   // Automatic-row writes and reads.
   Status Put(std::string_view column, std::string_view key, std::span<const std::byte> value);
   Status Put(std::string_view column, std::string_view key, std::string_view value);
+  // Automatic-row batch. Records are routed and staged in bounded chunks,
+  // with one partition lock per used partition instead of one lock per key.
+  // Input order is retained for duplicate keys, so the last value wins.
+  Status PutStructs(std::string_view column, std::span<const StructEntry> entries);
   Status Get(std::string_view column, std::string_view key, std::vector<std::byte>& value) const;
   Status Get(std::string_view column, std::string_view key, std::string& value) const;
 

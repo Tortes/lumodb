@@ -33,6 +33,7 @@ constexpr uint64_t kMinimumMemoryBudget = 64ULL * 1024 * 1024;
 constexpr uint32_t kMinimumStageBuffer = 4 * 1024;
 constexpr uint32_t kMaximumStageBuffer = 16 * 1024 * 1024;
 constexpr uint32_t kMaximumDedupPresizeEntries = 64 * 1024;
+constexpr size_t kMaximumBatchRoutingEntries = 64 * 1024;
 constexpr double kRowLoadFactor = 0.75;
 constexpr uint64_t kExplicitRowBit = 1ULL << 63;
 constexpr std::string_view kIncompleteMarkerName = "build.incomplete";
@@ -163,6 +164,81 @@ class Database::Impl {
   Status Put(std::string_view column, uint64_t rowId, std::string_view key,
              std::span<const std::byte> value) {
     return PutInternal(column, rowId, true, key, value);
+  }
+
+  Status PutStructs(std::string_view column, std::span<const StructEntry> entries) {
+    std::shared_lock lifecycleLock(lifecycleMutex_);
+    Status status = ValidateWritableState();
+    if (!status) {
+      return status;
+    }
+    if (entries.empty()) {
+      return Status::Ok();
+    }
+    for (const StructEntry& entry : entries) {
+      status = ValidateStageRecord(column, entry.key, entry.flatBufferBytes);
+      if (!status) {
+        return status;
+      }
+    }
+
+    status = BeginBuild();
+    if (!status) {
+      writePoisoned_.store(true, std::memory_order_release);
+      return status;
+    }
+
+    struct RoutedEntry {
+      size_t index = 0;
+      uint64_t keyHash = 0;
+      uint64_t rowId = 0;
+    };
+    const uint64_t columnHash = NormalizeHash(detail::HashString(column));
+    std::vector<std::vector<RoutedEntry>> partitionEntries(spillPartitions_.size());
+    const size_t maximumChunkSize = std::min(kMaximumBatchRoutingEntries, entries.size());
+    const size_t reservePerPartition = maximumChunkSize / spillPartitions_.size() + 1;
+    for (auto& partitionGroup : partitionEntries) {
+      partitionGroup.reserve(reservePerPartition);
+    }
+
+    for (size_t chunkBegin = 0; chunkBegin < entries.size();) {
+      const size_t chunkSize =
+          std::min(kMaximumBatchRoutingEntries, entries.size() - chunkBegin);
+      const size_t chunkEnd = chunkBegin + chunkSize;
+      for (size_t index = chunkBegin; index < chunkEnd; ++index) {
+        const uint64_t keyHash = NormalizeHash(detail::HashString(entries[index].key));
+        const uint64_t routeHash =
+            detail::MixHashes(detail::MixHashes(columnHash, keyHash), RoutingSeed());
+        const uint64_t rowId = routeHash % routeCount_;
+        const uint32_t partitionId = static_cast<uint32_t>(
+            detail::MixHashes(columnHash, rowId) % spillPartitions_.size());
+        partitionEntries[partitionId].push_back(
+            RoutedEntry{.index = index, .keyHash = keyHash, .rowId = rowId});
+      }
+
+      for (uint32_t partitionId = 0; partitionId < partitionEntries.size(); ++partitionId) {
+        const std::vector<RoutedEntry>& routedEntries = partitionEntries[partitionId];
+        if (routedEntries.empty()) {
+          continue;
+        }
+        SpillPartition& partition = *spillPartitions_[partitionId];
+        std::lock_guard partitionLock(partition.mutex);
+        for (const RoutedEntry& routed : routedEntries) {
+          const StructEntry& entry = entries[routed.index];
+          status = StageRecordLocked(partitionId, partition, column, columnHash, routed.rowId,
+                                     entry.key, routed.keyHash, entry.flatBufferBytes);
+          if (!status) {
+            writePoisoned_.store(true, std::memory_order_release);
+            return status;
+          }
+        }
+      }
+      for (auto& partitionGroup : partitionEntries) {
+        partitionGroup.clear();
+      }
+      chunkBegin = chunkEnd;
+    }
+    return Status::Ok();
   }
 
   Status PutRowStructs(std::string_view column, uint64_t rowId,
@@ -1879,6 +1955,11 @@ Status Database::Put(std::string_view column, std::string_view key,
 
 Status Database::Put(std::string_view column, std::string_view key, std::string_view value) {
   return Put(column, key, AsBytes(value));
+}
+
+Status Database::PutStructs(std::string_view column, std::span<const StructEntry> entries) {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->PutStructs(column, entries);
 }
 
 Status Database::Put(std::string_view column, uint64_t rowId, std::string_view key,

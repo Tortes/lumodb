@@ -25,6 +25,7 @@ struct Options {
   uint64_t explicitRows = 0;
   uint64_t memoryBytes = 64ULL * 1024 * 1024 * 1024;
   uint64_t reads = 10'000;
+  uint32_t batchSize = 1;
   bool keep = false;
 };
 
@@ -56,12 +57,14 @@ Options ParseOptions(int argc, char** argv) {
           static_cast<uint64_t>(std::stod(std::string(next())) * 1024 * 1024 * 1024);
     } else if (argument == "--reads") {
       options.reads = std::stoull(std::string(next()));
+    } else if (argument == "--batch-size") {
+      options.batchSize = static_cast<uint32_t>(std::stoul(std::string(next())));
     } else if (argument == "--keep") {
       options.keep = true;
     } else if (argument == "--help") {
       std::cout << "lumodb_bench [--dir PATH] [--entries N] [--value-bytes N] "
                    "[--threads N] [--row-shards N] [--explicit-rows N] "
-                   "[--memory-gb N] [--reads N] "
+                   "[--memory-gb N] [--reads N] [--batch-size N] "
                    "[--keep]\n";
       std::exit(EXIT_SUCCESS);
     } else {
@@ -69,12 +72,17 @@ Options ParseOptions(int argc, char** argv) {
       std::exit(EXIT_FAILURE);
     }
   }
-  if (options.entries == 0 || options.threads == 0 || options.memoryBytes == 0) {
-    std::cerr << "entries, threads, and memory-gb must be greater than zero\n";
+  if (options.entries == 0 || options.threads == 0 || options.memoryBytes == 0 ||
+      options.batchSize == 0) {
+    std::cerr << "entries, threads, memory-gb, and batch-size must be greater than zero\n";
     std::exit(EXIT_FAILURE);
   }
   if (options.explicitRows >= (1ULL << 63)) {
     std::cerr << "explicit-rows must be smaller than 2^63\n";
+    std::exit(EXIT_FAILURE);
+  }
+  if (options.explicitRows != 0 && options.batchSize != 1) {
+    std::cerr << "batch-size currently benchmarks automatic PutStructs only\n";
     std::exit(EXIT_FAILURE);
   }
   return options;
@@ -128,7 +136,8 @@ int main(int argc, char** argv) {
             << " target_entries_per_row=" << layout.targetEntriesPerRow
             << " routes=" << layout.routeCountPerColumn
             << " explicit_rows=" << arguments.explicitRows << " row_shards=" << layout.rowShardCount
-            << " spill_partitions=" << layout.spillPartitionCount << '\n';
+            << " spill_partitions=" << layout.spillPartitionCount
+            << " batch_size=" << arguments.batchSize << '\n';
 
   std::vector<std::byte> payload(arguments.valueBytes, std::byte{0x5a});
   const auto putStart = std::chrono::steady_clock::now();
@@ -136,6 +145,30 @@ int main(int argc, char** argv) {
   writers.reserve(arguments.threads);
   for (uint32_t threadId = 0; threadId < arguments.threads; ++threadId) {
     writers.emplace_back([&, threadId] {
+      if (arguments.explicitRows == 0 && arguments.batchSize > 1) {
+        std::vector<std::string> keys;
+        std::vector<LumoDB::StructEntry> entries;
+        keys.reserve(arguments.batchSize);
+        entries.reserve(arguments.batchSize);
+        auto flushBatch = [&] {
+          entries.clear();
+          for (const std::string& key : keys) {
+            entries.push_back({.key = key, .flatBufferBytes = payload});
+          }
+          Check(database.PutStructs("objects", entries), "PutStructs");
+          keys.clear();
+        };
+        for (uint64_t index = threadId; index < arguments.entries; index += arguments.threads) {
+          keys.push_back(Key(index));
+          if (keys.size() == arguments.batchSize) {
+            flushBatch();
+          }
+        }
+        if (!keys.empty()) {
+          flushBatch();
+        }
+        return;
+      }
       for (uint64_t index = threadId; index < arguments.entries; index += arguments.threads) {
         const LumoDB::Status status =
             arguments.explicitRows == 0
