@@ -76,6 +76,48 @@ uint64_t DivideRoundUp(uint64_t value, uint64_t divisor) {
 
 uint64_t AlignUp8(uint64_t value) { return (value + 7) & ~uint64_t{7}; }
 
+uint32_t KeyFingerprint(uint64_t keyHash) {
+  const uint32_t fingerprint = static_cast<uint32_t>(keyHash >> 32);
+  return fingerprint == 0 ? 1 : fingerprint;
+}
+
+size_t Varint32Size(uint32_t value) {
+  size_t size = 1;
+  while (value >= 0x80) {
+    value >>= 7;
+    ++size;
+  }
+  return size;
+}
+
+size_t WriteVarint32(std::byte* output, uint32_t value) {
+  size_t size = 0;
+  while (value >= 0x80) {
+    output[size++] = static_cast<std::byte>((value & 0x7f) | 0x80);
+    value >>= 7;
+  }
+  output[size++] = static_cast<std::byte>(value);
+  return size;
+}
+
+bool ReadVarint32(const std::byte* data, size_t size, size_t& cursor, uint32_t& value) {
+  value = 0;
+  for (uint32_t shift = 0; shift <= 28; shift += 7) {
+    if (cursor >= size) {
+      return false;
+    }
+    const uint32_t byte = std::to_integer<uint8_t>(data[cursor++]);
+    if (shift == 28 && (byte & 0xf0) != 0) {
+      return false;
+    }
+    value |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 uint32_t RoutingTargetEntries(uint32_t rowCapacity) {
   const uint32_t standardDeviation =
       static_cast<uint32_t>(std::ceil(std::sqrt(static_cast<double>(rowCapacity))));
@@ -409,12 +451,12 @@ class Database::Impl {
 
     const uint64_t bucketOffset =
         AlignUp8(sizeof(detail::RowBlockHeader) + lookup.header.columnSize);
-    const uint64_t keyBytesOffset =
+    const uint64_t recordsOffset =
         bucketOffset +
         static_cast<uint64_t>(lookup.header.bucketCount) * sizeof(detail::RowKeyBucket);
-    const uint64_t valueBytesOffset = keyBytesOffset + lookup.header.keyBytesSize;
     const uint64_t mask = lookup.header.bucketCount - 1;
     const uint64_t start = keyHash & mask;
+    const uint32_t fingerprint = KeyFingerprint(keyHash);
 
     for (uint64_t probe = 0; probe < lookup.header.bucketCount; ++probe) {
       const uint64_t bucketIndex = (start + probe) & mask;
@@ -424,22 +466,47 @@ class Database::Impl {
       if (!status) {
         return status;
       }
-      if (bucket.keyHash == 0) {
+      if (bucket.keyFingerprint == 0) {
         return Status::NotFound("key not found");
       }
-      if (bucket.keyHash != keyHash || bucket.keySize != key.size()) {
+      if (bucket.keyFingerprint != fingerprint) {
         continue;
       }
-      if (bucket.keyOffset > lookup.header.keyBytesSize ||
-          bucket.keySize > lookup.header.keyBytesSize - bucket.keyOffset ||
-          bucket.valueOffset > lookup.header.valueBytesSize ||
-          bucket.valueSize > lookup.header.valueBytesSize - bucket.valueOffset) {
+      if (bucket.recordOffset >= lookup.header.recordBytesSize) {
         return Status::Corruption("row bucket points outside its block");
       }
 
-      std::string storedKey(bucket.keySize, '\0');
+      std::array<std::byte, 10> encodedLengths{};
+      const size_t encodedBytes = std::min<size_t>(
+          encodedLengths.size(), lookup.header.recordBytesSize - bucket.recordOffset);
+      status = ReadRowAt(lookup.bucket.shardId, encodedLengths.data(), encodedBytes,
+                         lookup.bucket.blockOffset + recordsOffset + bucket.recordOffset);
+      if (!status) {
+        return status;
+      }
+      size_t lengthCursor = 0;
+      uint32_t keySize = 0;
+      uint32_t valueSize = 0;
+      if (!ReadVarint32(encodedLengths.data(), encodedBytes, lengthCursor, keySize) ||
+          !ReadVarint32(encodedLengths.data(), encodedBytes, lengthCursor, valueSize)) {
+        return Status::Corruption("row record has invalid lengths");
+      }
+      uint64_t keyOffset = 0;
+      uint64_t valueOffset = 0;
+      uint64_t recordEnd = 0;
+      if (!CheckedAdd(bucket.recordOffset, lengthCursor, keyOffset) ||
+          !CheckedAdd(keyOffset, keySize, valueOffset) ||
+          !CheckedAdd(valueOffset, valueSize, recordEnd) ||
+          recordEnd > lookup.header.recordBytesSize) {
+        return Status::Corruption("row record points outside its block");
+      }
+      if (keySize != key.size()) {
+        continue;
+      }
+
+      std::string storedKey(keySize, '\0');
       status = ReadRowAt(lookup.bucket.shardId, storedKey.data(), storedKey.size(),
-                         lookup.bucket.blockOffset + keyBytesOffset + bucket.keyOffset);
+                         lookup.bucket.blockOffset + recordsOffset + keyOffset);
       if (!status) {
         return status;
       }
@@ -447,9 +514,9 @@ class Database::Impl {
         continue;
       }
 
-      value.resize(bucket.valueSize);
+      value.resize(valueSize);
       return ReadRowAt(lookup.bucket.shardId, value.data(), value.size(),
-                       lookup.bucket.blockOffset + valueBytesOffset + bucket.valueOffset);
+                       lookup.bucket.blockOffset + recordsOffset + valueOffset);
     }
     return Status::NotFound("key not found");
   }
@@ -799,11 +866,11 @@ class Database::Impl {
       uint64_t estimated = sizeof(detail::RowBlockHeader) + 32;
       uint64_t bucketBytes = 0;
       uint64_t payloadBytes = 0;
+      const uint64_t payloadBytesPerEntry =
+          static_cast<uint64_t>(options_.averageKeyBytes) + options_.averageValueBytes +
+          Varint32Size(options_.averageKeyBytes) + Varint32Size(options_.averageValueBytes);
       if (!CheckedMultiply(bucketCount, sizeof(detail::RowKeyBucket), bucketBytes) ||
-          !CheckedMultiply(
-              candidate,
-              static_cast<uint64_t>(options_.averageKeyBytes) + options_.averageValueBytes,
-              payloadBytes) ||
+          !CheckedMultiply(candidate, payloadBytesPerEntry, payloadBytes) ||
           !CheckedAdd(estimated, bucketBytes, estimated) ||
           !CheckedAdd(estimated, payloadBytes, estimated)) {
         break;
@@ -1393,32 +1460,43 @@ class Database::Impl {
       return status;
     }
     const uint64_t bucketOffset = AlignUp8(sizeof(header) + header.columnSize);
-    const uint64_t keyBytesOffset =
+    const uint64_t recordsOffset =
         bucketOffset + static_cast<uint64_t>(header.bucketCount) * sizeof(detail::RowKeyBucket);
-    const uint64_t valueBytesOffset = keyBytesOffset + header.keyBytesSize;
+    const std::byte* records = block.data() + recordsOffset;
     entries.reserve(header.itemCount);
     for (uint32_t index = 0; index < header.bucketCount; ++index) {
       detail::RowKeyBucket bucket;
       std::memcpy(&bucket,
                   block.data() + bucketOffset + static_cast<uint64_t>(index) * sizeof(bucket),
                   sizeof(bucket));
-      if (bucket.keyHash == 0) {
+      if (bucket.keyFingerprint == 0) {
         continue;
       }
-      if (bucket.keyOffset > header.keyBytesSize ||
-          bucket.keySize > header.keyBytesSize - bucket.keyOffset ||
-          bucket.valueOffset > header.valueBytesSize ||
-          bucket.valueSize > header.valueBytesSize - bucket.valueOffset) {
+      if (bucket.recordOffset >= header.recordBytesSize) {
         return Status::Corruption("row bucket points outside its block");
       }
+      size_t cursor = bucket.recordOffset;
+      uint32_t keySize = 0;
+      uint32_t valueSize = 0;
+      if (!ReadVarint32(records, header.recordBytesSize, cursor, keySize) ||
+          !ReadVarint32(records, header.recordBytesSize, cursor, valueSize) ||
+          keySize > header.recordBytesSize - cursor) {
+        return Status::Corruption("row record has invalid lengths");
+      }
+      const size_t keyOffset = cursor;
+      cursor += keySize;
+      if (valueSize > header.recordBytesSize - cursor) {
+        return Status::Corruption("row record points outside its block");
+      }
       OwnedEntry entry;
-      entry.key.assign(
-          reinterpret_cast<const char*>(block.data() + keyBytesOffset + bucket.keyOffset),
-          bucket.keySize);
-      entry.value.resize(bucket.valueSize);
-      if (bucket.valueSize != 0) {
-        std::memcpy(entry.value.data(), block.data() + valueBytesOffset + bucket.valueOffset,
-                    bucket.valueSize);
+      entry.key.assign(reinterpret_cast<const char*>(records + keyOffset), keySize);
+      if (KeyFingerprint(NormalizeHash(detail::HashString(entry.key))) !=
+          bucket.keyFingerprint) {
+        return Status::Corruption("row bucket fingerprint does not match its key");
+      }
+      entry.value.resize(valueSize);
+      if (valueSize != 0) {
+        std::memcpy(entry.value.data(), records + cursor, valueSize);
       }
       entries.push_back(std::move(entry));
     }
@@ -1544,19 +1622,25 @@ class Database::Impl {
     }
     const uint32_t bucketCount = static_cast<uint32_t>(bucketCount64);
 
-    uint64_t keyBytesSize = 0;
-    uint64_t valueBytesSize = 0;
+    uint64_t recordBytesSize = 0;
     for (const TemporaryKeySlot& slot : temporary) {
       if (slot.keyHash == 0) {
         continue;
       }
-      if (!CheckedAdd(keyBytesSize, entries[slot.entryIndex].key.size(), keyBytesSize) ||
-          !CheckedAdd(valueBytesSize, entries[slot.entryIndex].value.size(), valueBytesSize)) {
+      const EntryView& entry = entries[slot.entryIndex];
+      if (entry.key.size() > std::numeric_limits<uint32_t>::max() ||
+          entry.value.size() > std::numeric_limits<uint32_t>::max()) {
+        return Status::InvalidArgument("row key and value must each be smaller than 4 GiB");
+      }
+      uint64_t recordSize = Varint32Size(static_cast<uint32_t>(entry.key.size())) +
+                            Varint32Size(static_cast<uint32_t>(entry.value.size()));
+      if (!CheckedAdd(recordSize, entry.key.size(), recordSize) ||
+          !CheckedAdd(recordSize, entry.value.size(), recordSize) ||
+          !CheckedAdd(recordBytesSize, recordSize, recordBytesSize)) {
         return Status::InvalidArgument("row payload size overflows uint64");
       }
     }
-    if (keyBytesSize > std::numeric_limits<uint32_t>::max() ||
-        valueBytesSize > std::numeric_limits<uint32_t>::max() ||
+    if (recordBytesSize > std::numeric_limits<uint32_t>::max() ||
         column.size() > std::numeric_limits<uint32_t>::max()) {
       return Status::InvalidArgument(
           "one routed row exceeds the 4 GiB compact-row limit; increase "
@@ -1565,13 +1649,11 @@ class Database::Impl {
 
     const uint64_t bucketOffset = AlignUp8(sizeof(detail::RowBlockHeader) + column.size());
     uint64_t bucketBytes = 0;
-    uint64_t keyBytesOffset = 0;
-    uint64_t valueBytesOffset = 0;
+    uint64_t recordsOffset = 0;
     uint64_t blockSize = 0;
     if (!CheckedMultiply(bucketCount, sizeof(detail::RowKeyBucket), bucketBytes) ||
-        !CheckedAdd(bucketOffset, bucketBytes, keyBytesOffset) ||
-        !CheckedAdd(keyBytesOffset, keyBytesSize, valueBytesOffset) ||
-        !CheckedAdd(valueBytesOffset, valueBytesSize, blockSize) ||
+        !CheckedAdd(bucketOffset, bucketBytes, recordsOffset) ||
+        !CheckedAdd(recordsOffset, recordBytesSize, blockSize) ||
         blockSize > std::numeric_limits<uint32_t>::max() ||
         blockSize > std::numeric_limits<size_t>::max()) {
       return Status::InvalidArgument("row block exceeds the 4 GiB format limit");
@@ -1585,14 +1667,12 @@ class Database::Impl {
     header.columnSize = static_cast<uint32_t>(column.size());
     header.itemCount = uniqueCount;
     header.bucketCount = bucketCount;
-    header.keyBytesSize = static_cast<uint32_t>(keyBytesSize);
-    header.valueBytesSize = static_cast<uint32_t>(valueBytesSize);
+    header.recordBytesSize = static_cast<uint32_t>(recordBytesSize);
     header.blockSize = static_cast<uint32_t>(blockSize);
     std::memcpy(block.data(), &header, sizeof(header));
     std::memcpy(block.data() + sizeof(header), column.data(), column.size());
 
-    uint32_t keyCursor = 0;
-    uint32_t valueCursor = 0;
+    uint32_t recordCursor = 0;
     for (uint32_t bucketIndex = 0; bucketIndex < bucketCount; ++bucketIndex) {
       const TemporaryKeySlot& temporarySlot = temporary[bucketIndex];
       if (temporarySlot.keyHash == 0) {
@@ -1600,22 +1680,29 @@ class Database::Impl {
       }
       const EntryView& entry = entries[temporarySlot.entryIndex];
       detail::RowKeyBucket bucket;
-      bucket.keyHash = temporarySlot.keyHash;
-      bucket.keyOffset = keyCursor;
-      bucket.keySize = static_cast<uint32_t>(entry.key.size());
-      bucket.valueOffset = valueCursor;
-      bucket.valueSize = static_cast<uint32_t>(entry.value.size());
+      bucket.keyFingerprint = KeyFingerprint(temporarySlot.keyHash);
+      bucket.recordOffset = recordCursor;
       std::memcpy(block.data() + bucketOffset + static_cast<uint64_t>(bucketIndex) * sizeof(bucket),
                   &bucket, sizeof(bucket));
+
+      std::byte* record = block.data() + recordsOffset + recordCursor;
+      recordCursor += static_cast<uint32_t>(
+          WriteVarint32(record, static_cast<uint32_t>(entry.key.size())));
+      record = block.data() + recordsOffset + recordCursor;
+      recordCursor += static_cast<uint32_t>(
+          WriteVarint32(record, static_cast<uint32_t>(entry.value.size())));
       if (!entry.key.empty()) {
-        std::memcpy(block.data() + keyBytesOffset + keyCursor, entry.key.data(), entry.key.size());
+        std::memcpy(block.data() + recordsOffset + recordCursor, entry.key.data(), entry.key.size());
       }
+      recordCursor += static_cast<uint32_t>(entry.key.size());
       if (!entry.value.empty()) {
-        std::memcpy(block.data() + valueBytesOffset + valueCursor, entry.value.data(),
+        std::memcpy(block.data() + recordsOffset + recordCursor, entry.value.data(),
                     entry.value.size());
       }
-      keyCursor += bucket.keySize;
-      valueCursor += bucket.valueSize;
+      recordCursor += static_cast<uint32_t>(entry.value.size());
+    }
+    if (recordCursor != recordBytesSize) {
+      return Status::Corruption("packed row record size mismatch");
     }
     itemCount = uniqueCount;
     return Status::Ok();
@@ -1770,8 +1857,7 @@ class Database::Impl {
     uint64_t expectedSize = 0;
     if (!CheckedMultiply(header.bucketCount, sizeof(detail::RowKeyBucket), bucketBytes) ||
         !CheckedAdd(bucketOffset, bucketBytes, expectedSize) ||
-        !CheckedAdd(expectedSize, header.keyBytesSize, expectedSize) ||
-        !CheckedAdd(expectedSize, header.valueBytesSize, expectedSize) ||
+        !CheckedAdd(expectedSize, header.recordBytesSize, expectedSize) ||
         expectedSize != header.blockSize) {
       return Status::Corruption("row block size is invalid");
     }

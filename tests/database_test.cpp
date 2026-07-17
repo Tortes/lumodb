@@ -14,6 +14,8 @@
 #include <unistd.h>
 #endif
 
+#include "lumodb/file.h"
+#include "lumodb/hash.h"
 #include "lumodb/storage_format.h"
 
 namespace {
@@ -349,6 +351,45 @@ TEST(DatabaseTest, GetRowStructDirectlySelectsExplicitRow) {
   EXPECT_EQ(value, rowSeven);
 }
 
+TEST(DatabaseTest, PackedRowsHandleVarintBoundariesAndFingerprintCollisions) {
+  const auto directory = LumoDB::test::MakeTestDirectory("packed-row-boundaries");
+  LumoDB::DatabaseOptions options = TestOptions(1'000);
+  options.rowShardCount = 1;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  constexpr std::string_view collisionKeyA = "fingerprint-key-690763";
+  constexpr std::string_view collisionKeyB = "fingerprint-key-823910";
+  const uint64_t hashA = LumoDB::detail::HashString(collisionKeyA);
+  const uint64_t hashB = LumoDB::detail::HashString(collisionKeyB);
+  EXPECT_EQ(static_cast<uint32_t>(hashA >> 32), static_cast<uint32_t>(hashB >> 32));
+  EXPECT_EQ(hashA & 3, hashB & 3);
+
+  const std::vector<std::byte> value127(127, std::byte{0x17});
+  const std::vector<std::byte> value128(128, std::byte{0x18});
+  const std::array<LumoDB::RowStructEntry, 2> collidingEntries = {
+      LumoDB::RowStructEntry{.key = collisionKeyA, .flatBufferBytes = value127},
+      LumoDB::RowStructEntry{.key = collisionKeyB, .flatBufferBytes = value128},
+  };
+  ASSERT_OK(database.PutRowStructs("packed", 1, collidingEntries));
+
+  const std::string longKey(300, 'k');
+  const std::vector<std::byte> value16384(16 * 1024, std::byte{0x3c});
+  const std::array<LumoDB::RowStructEntry, 1> longEntry = {
+      LumoDB::RowStructEntry{.key = longKey, .flatBufferBytes = value16384},
+  };
+  ASSERT_OK(database.PutRowStructs("packed", 2, longEntry));
+  ASSERT_OK(database.Flush());
+
+  std::vector<std::byte> value;
+  ASSERT_OK(database.GetRowStruct("packed", 1, collisionKeyA, value));
+  EXPECT_EQ(value, value127);
+  ASSERT_OK(database.GetRowStruct("packed", 1, collisionKeyB, value));
+  EXPECT_EQ(value, value128);
+  ASSERT_OK(database.GetRowStruct("packed", 2, longKey, value));
+  EXPECT_EQ(value, value16384);
+}
+
 TEST(DatabaseTest, AutomaticAndExplicitRowsCanCoexist) {
   const auto directory = LumoDB::test::MakeTestDirectory("mixed-row-routing");
   LumoDB::Database database;
@@ -601,8 +642,50 @@ TEST(DatabaseTest, InterruptedBuildIsRejected) {
 #endif
 
 TEST(StorageFormatTest, HotBucketsAreCompact) {
-  EXPECT_EQ(sizeof(LumoDB::detail::RowKeyBucket), 24);
+  EXPECT_EQ(sizeof(LumoDB::detail::RowKeyBucket), 8);
   EXPECT_EQ(sizeof(LumoDB::detail::RowIndexBucket), 48);
+}
+
+TEST(StorageFormatTest, RejectsMalformedPackedRecordLengths) {
+  const auto directory = LumoDB::test::MakeTestDirectory("corrupt-packed-record");
+  LumoDB::DatabaseOptions options = TestOptions(100);
+  options.rowShardCount = 1;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+  ASSERT_OK(database.Put("column", 0, "key", "value"));
+  ASSERT_OK(database.Close());
+
+  LumoDB::detail::FileDescriptor file;
+  ASSERT_OK(LumoDB::detail::OpenReadWriteCreate(directory / "row_values-000.lumorv", file));
+  LumoDB::detail::RowBlockHeader header;
+  constexpr uint64_t blockOffset = sizeof(LumoDB::detail::RowValueFileHeader);
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &header, sizeof(header), blockOffset));
+  const uint64_t bucketOffset =
+      (sizeof(header) + header.columnSize + 7) & ~uint64_t{7};
+  LumoDB::detail::RowKeyBucket occupied;
+  for (uint32_t index = 0; index < header.bucketCount; ++index) {
+    ASSERT_OK(LumoDB::detail::ReadAllAt(
+        file.Get(), &occupied, sizeof(occupied),
+        blockOffset + bucketOffset + static_cast<uint64_t>(index) * sizeof(occupied)));
+    if (occupied.keyFingerprint != 0) {
+      break;
+    }
+  }
+  ASSERT_NE(occupied.keyFingerprint, 0U);
+  const uint64_t recordsOffset =
+      bucketOffset + static_cast<uint64_t>(header.bucketCount) * sizeof(occupied);
+  const std::array<std::byte, 5> malformed = {
+      std::byte{0x80}, std::byte{0x80}, std::byte{0x80}, std::byte{0x80}, std::byte{0x80},
+  };
+  ASSERT_OK(LumoDB::detail::WriteAllAt(file.Get(), malformed.data(), malformed.size(),
+                                      blockOffset + recordsOffset + occupied.recordOffset));
+  ASSERT_OK(LumoDB::detail::SyncFile(file.Get()));
+  file.Reset();
+
+  ASSERT_OK(database.OpenReadOnly(directory));
+  std::vector<std::byte> value;
+  EXPECT_EQ(database.GetRowStruct("column", 0, "key", value).Code(),
+            LumoDB::StatusCode::kCorruption);
 }
 
 TEST(DatabaseTest, ReportsInvalidStateAndArguments) {

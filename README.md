@@ -155,9 +155,12 @@ Read-only Open mmaps the outer index and row-value shards. A random lookup does:
 3. probe the row's compact local key table;
 4. compare the stored key and copy the value.
 
-`RowKeyBucket` is 24 bytes and `RowIndexBucket` is 48 bytes. Empty local buckets
-use `keyHash == 0`, so no separate state byte or 64-bit offsets are needed in
-the hot table. Row data itself remains immutable after publication.
+`RowKeyBucket` is 8 bytes and `RowIndexBucket` is 48 bytes. Each local bucket
+stores a 32-bit hash fingerprint plus a 32-bit offset into a packed record
+region. A record stores varint key/value lengths followed by adjacent key and
+value bytes. Empty buckets use `keyFingerprint == 0`; fingerprint matches are
+always verified against the full stored key, so collisions preserve exact
+lookup semantics. Row data itself remains immutable after publication.
 
 ## Files
 
@@ -168,8 +171,9 @@ the hot table. Row data itself remains immutable after publication.
 | `stage-NNN.lumost` | temporary sequential spill files; removed after Flush |
 | `build.incomplete` | incomplete compiler-output marker |
 
-The row format is intentionally incompatible with databases created by the
-former object/unique format. Rebuild those outputs in a fresh directory.
+The v3 compact-row format is intentionally incompatible with databases created
+by the former object/unique or v2 24-byte-bucket formats. Rebuild those outputs
+in a fresh directory.
 
 ## Build and test
 
@@ -180,7 +184,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 The test suite covers automatic/explicit row coexistence, duplicate resolution,
-updates across Flush calls, concurrent Put, index growth, column isolation,
+updates across Flush calls, concurrent Put, packed-record varint boundaries,
+fingerprint collisions, malformed records, index growth, column isolation,
 read-only mmap access, and rejection of interrupted builds.
 
 ## Benchmark

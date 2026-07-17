@@ -81,10 +81,6 @@ Options ParseOptions(int argc, char** argv) {
     std::cerr << "explicit-rows must be smaller than 2^63\n";
     std::exit(EXIT_FAILURE);
   }
-  if (options.explicitRows != 0 && options.batchSize != 1) {
-    std::cerr << "batch-size currently benchmarks automatic PutStructs only\n";
-    std::exit(EXIT_FAILURE);
-  }
   return options;
 }
 
@@ -145,12 +141,14 @@ int main(int argc, char** argv) {
   writers.reserve(arguments.threads);
   for (uint32_t threadId = 0; threadId < arguments.threads; ++threadId) {
     writers.emplace_back([&, threadId] {
-      if (arguments.explicitRows == 0 && arguments.batchSize > 1) {
+      if (arguments.batchSize > 1) {
         std::vector<std::string> keys;
         std::vector<LumoDB::StructEntry> entries;
+        std::vector<LumoDB::RowStructEntry> rowEntries;
         keys.reserve(arguments.batchSize);
         entries.reserve(arguments.batchSize);
-        auto flushBatch = [&] {
+        rowEntries.reserve(arguments.batchSize);
+        auto flushAutomaticBatch = [&] {
           entries.clear();
           for (const std::string& key : keys) {
             entries.push_back({.key = key, .flatBufferBytes = payload});
@@ -158,14 +156,38 @@ int main(int argc, char** argv) {
           Check(database.PutStructs("objects", entries), "PutStructs");
           keys.clear();
         };
-        for (uint64_t index = threadId; index < arguments.entries; index += arguments.threads) {
-          keys.push_back(Key(index));
-          if (keys.size() == arguments.batchSize) {
-            flushBatch();
+        auto flushExplicitBatch = [&](uint64_t rowId) {
+          rowEntries.clear();
+          for (const std::string& key : keys) {
+            rowEntries.push_back({.key = key, .flatBufferBytes = payload});
           }
-        }
-        if (!keys.empty()) {
-          flushBatch();
+          Check(database.PutRowStructs("objects", rowId, rowEntries), "PutRowStructs");
+          keys.clear();
+        };
+        if (arguments.explicitRows == 0) {
+          for (uint64_t index = threadId; index < arguments.entries; index += arguments.threads) {
+            keys.push_back(Key(index));
+            if (keys.size() == arguments.batchSize) {
+              flushAutomaticBatch();
+            }
+          }
+          if (!keys.empty()) {
+            flushAutomaticBatch();
+          }
+        } else {
+          const uint64_t usedRows = std::min(arguments.explicitRows, arguments.entries);
+          for (uint64_t rowId = threadId; rowId < usedRows; rowId += arguments.threads) {
+            for (uint64_t index = rowId; index < arguments.entries;
+                 index += arguments.explicitRows) {
+              keys.push_back(Key(index));
+              if (keys.size() == arguments.batchSize) {
+                flushExplicitBatch(rowId);
+              }
+            }
+            if (!keys.empty()) {
+              flushExplicitBatch(rowId);
+            }
+          }
         }
         return;
       }

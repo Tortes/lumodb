@@ -9,12 +9,12 @@ namespace LumoDB::detail {
 static_assert(std::endian::native == std::endian::little,
               "LumoDB currently stores fixed headers in little-endian form");
 
-inline constexpr uint32_t kStorageVersion = 2;
-inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R', 'V', '0', '0', '2'};
-inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R', 'I', '0', '0', '3'};
-inline constexpr std::array<char, 8> kStageFileMagic = {'L', 'U', 'M', 'S', 'T', '0', '0', '1'};
-inline constexpr uint32_t kRowBlockMagic = 0x32424f52;     // "ROB2".
-inline constexpr uint32_t kStageRecordMagic = 0x31544753;  // "SGT1".
+inline constexpr uint32_t kStorageVersion = 3;
+inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R', 'V', '0', '0', '3'};
+inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R', 'I', '0', '0', '4'};
+inline constexpr std::array<char, 8> kStageFileMagic = {'L', 'U', 'M', 'S', 'T', '0', '0', '2'};
+inline constexpr uint32_t kRowBlockMagic = 0x33424f52;     // "ROB3".
+inline constexpr uint32_t kStageRecordMagic = 0x32544753;  // "SGT2".
 inline constexpr uint64_t kRoutingSeed = 0x9e3779b97f4a7c15ULL;
 
 struct RowValueFileHeader {
@@ -65,21 +65,18 @@ struct RowBlockHeader {
   uint32_t columnSize = 0;
   uint32_t itemCount = 0;
   uint32_t bucketCount = 0;
-  uint32_t keyBytesSize = 0;
-  uint32_t valueBytesSize = 0;
+  uint32_t recordBytesSize = 0;
   uint32_t blockSize = 0;
   uint32_t reserved32 = 0;
+  uint64_t reserved64 = 0;
 };
 
-// Compact 24-byte local bucket. keyHash == 0 means empty. All offsets are
-// relative to the row's key/value regions, which keeps the hot lookup table
-// small while allowing row blocks up to 4 GiB.
+// Compact 8-byte local bucket. keyFingerprint == 0 means empty. recordOffset
+// is relative to the row's packed record region. The full key stored in the
+// record is always compared, so a 32-bit fingerprint collision is harmless.
 struct RowKeyBucket {
-  uint64_t keyHash = 0;
-  uint32_t keyOffset = 0;
-  uint32_t keySize = 0;
-  uint32_t valueOffset = 0;
-  uint32_t valueSize = 0;
+  uint32_t keyFingerprint = 0;
+  uint32_t recordOffset = 0;
 };
 
 struct StageFileHeader {
@@ -108,7 +105,7 @@ static_assert(sizeof(RowValueFileHeader) == 24);
 static_assert(sizeof(RowIndexFileHeader) == 96);
 static_assert(sizeof(RowIndexBucket) == 48);
 static_assert(sizeof(RowBlockHeader) == 64);
-static_assert(sizeof(RowKeyBucket) == 24);
+static_assert(sizeof(RowKeyBucket) == 8);
 static_assert(sizeof(StageFileHeader) == 32);
 static_assert(sizeof(StageRecordHeader) == 48);
 
