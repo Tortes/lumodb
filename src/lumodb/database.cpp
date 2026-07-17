@@ -165,34 +165,66 @@ class Database::Impl {
     return PutInternal(column, rowId, true, key, value);
   }
 
+  Status PutRowStructs(std::string_view column, uint64_t rowId,
+                       std::span<const RowStructEntry> entries) {
+    std::shared_lock lifecycleLock(lifecycleMutex_);
+    Status status = ValidateWritableState();
+    if (!status) {
+      return status;
+    }
+    if (rowId >= kExplicitRowBit) {
+      return Status::InvalidArgument("explicit rowId must be smaller than 2^63");
+    }
+    if (entries.empty()) {
+      return Status::InvalidArgument("row entries must not be empty");
+    }
+    for (const RowStructEntry& entry : entries) {
+      status = ValidateStageRecord(column, entry.key, entry.flatBufferBytes);
+      if (!status) {
+        return status;
+      }
+    }
+
+    status = BeginBuild();
+    if (!status) {
+      writePoisoned_.store(true, std::memory_order_release);
+      return status;
+    }
+
+    const uint64_t columnHash = NormalizeHash(detail::HashString(column));
+    const uint64_t internalRowId = rowId | kExplicitRowBit;
+    const uint32_t partitionId = static_cast<uint32_t>(
+        detail::MixHashes(columnHash, internalRowId) % spillPartitions_.size());
+    SpillPartition& partition = *spillPartitions_[partitionId];
+    std::lock_guard partitionLock(partition.mutex);
+    for (const RowStructEntry& entry : entries) {
+      const uint64_t keyHash = NormalizeHash(detail::HashString(entry.key));
+      status = StageRecordLocked(partitionId, partition, column, columnHash, internalRowId,
+                                 entry.key, keyHash, entry.flatBufferBytes);
+      if (!status) {
+        writePoisoned_.store(true, std::memory_order_release);
+        return status;
+      }
+    }
+    return Status::Ok();
+  }
+
   Status PutInternal(std::string_view column, uint64_t requestedRowId, bool explicitRow,
                      std::string_view key, std::span<const std::byte> value) {
     std::shared_lock lifecycleLock(lifecycleMutex_);
-    if (!open_) {
-      return Status::NotOpen("database is not open");
-    }
-    if (readOnly_) {
-      return Status::InvalidArgument("database is read-only");
-    }
-    if (writePoisoned_.load(std::memory_order_acquire)) {
-      return Status::Corruption("write batch failed; delete the output directory and rebuild it");
-    }
-    if (column.empty()) {
-      return Status::InvalidArgument("column must not be empty");
-    }
-    if (key.empty()) {
-      return Status::InvalidArgument("key must not be empty");
+    Status status = ValidateWritableState();
+    if (!status) {
+      return status;
     }
     if (explicitRow && requestedRowId >= kExplicitRowBit) {
       return Status::InvalidArgument("explicit rowId must be smaller than 2^63");
     }
-    if (column.size() > std::numeric_limits<uint32_t>::max() ||
-        key.size() > std::numeric_limits<uint32_t>::max() ||
-        value.size() > std::numeric_limits<uint32_t>::max()) {
-      return Status::InvalidArgument("column, key, and value must each be smaller than 4 GiB");
+    status = ValidateStageRecord(column, key, value);
+    if (!status) {
+      return status;
     }
 
-    Status status = BeginBuild();
+    status = BeginBuild();
     if (!status) {
       writePoisoned_.store(true, std::memory_order_release);
       return status;
@@ -209,64 +241,49 @@ class Database::Impl {
     const uint32_t partitionId =
         static_cast<uint32_t>(detail::MixHashes(columnHash, rowId) % spillPartitions_.size());
 
-    detail::StageRecordHeader record;
-    record.columnHash = columnHash;
-    record.keyHash = keyHash;
-    record.rowId = rowId;
-    record.columnSize = static_cast<uint32_t>(column.size());
-    record.keySize = static_cast<uint32_t>(key.size());
-    record.valueSize = static_cast<uint32_t>(value.size());
+    SpillPartition& partition = *spillPartitions_[partitionId];
+    std::lock_guard partitionLock(partition.mutex);
+    status =
+        StageRecordLocked(partitionId, partition, column, columnHash, rowId, key, keyHash, value);
+    if (!status) {
+      writePoisoned_.store(true, std::memory_order_release);
+    }
+    return status;
+  }
 
-    uint64_t recordSize = sizeof(record);
+  Status ValidateWritableState() const {
+    if (!open_) {
+      return Status::NotOpen("database is not open");
+    }
+    if (readOnly_) {
+      return Status::InvalidArgument("database is read-only");
+    }
+    if (writePoisoned_.load(std::memory_order_acquire)) {
+      return Status::Corruption("write batch failed; delete the output directory and rebuild it");
+    }
+    return Status::Ok();
+  }
+
+  Status ValidateStageRecord(std::string_view column, std::string_view key,
+                             std::span<const std::byte> value) const {
+    if (column.empty()) {
+      return Status::InvalidArgument("column must not be empty");
+    }
+    if (key.empty()) {
+      return Status::InvalidArgument("key must not be empty");
+    }
+    if (column.size() > std::numeric_limits<uint32_t>::max() ||
+        key.size() > std::numeric_limits<uint32_t>::max() ||
+        value.size() > std::numeric_limits<uint32_t>::max()) {
+      return Status::InvalidArgument("column, key, and value must each be smaller than 4 GiB");
+    }
+    uint64_t recordSize = sizeof(detail::StageRecordHeader);
     if (!CheckedAdd(recordSize, column.size(), recordSize) ||
         !CheckedAdd(recordSize, key.size(), recordSize) ||
         !CheckedAdd(recordSize, value.size(), recordSize) ||
         recordSize > std::numeric_limits<size_t>::max()) {
       return Status::InvalidArgument("staged record is too large");
     }
-
-    SpillPartition& partition = *spillPartitions_[partitionId];
-    std::lock_guard partitionLock(partition.mutex);
-    status = EnsureStageFileOpen(partitionId, partition);
-    if (!status) {
-      writePoisoned_.store(true, std::memory_order_release);
-      return status;
-    }
-
-    if (!partition.buffer.empty() &&
-        partition.buffer.size() + recordSize > options_.stageBufferBytes) {
-      status = FlushStageBuffer(partition);
-      if (!status) {
-        writePoisoned_.store(true, std::memory_order_release);
-        return status;
-      }
-    }
-
-    if (recordSize > options_.stageBufferBytes) {
-      std::vector<std::byte> packed;
-      packed.reserve(static_cast<size_t>(recordSize));
-      AppendRaw(packed, &record, sizeof(record));
-      AppendRaw(packed, column.data(), column.size());
-      AppendRaw(packed, key.data(), key.size());
-      AppendRaw(packed, value.data(), value.size());
-      status = detail::WriteAllAt(partition.file.Get(), packed.data(), packed.size(),
-                                  partition.persistedSize);
-      if (status) {
-        partition.persistedSize += packed.size();
-      }
-    } else {
-      partition.buffer.reserve(options_.stageBufferBytes);
-      AppendRaw(partition.buffer, &record, sizeof(record));
-      AppendRaw(partition.buffer, column.data(), column.size());
-      AppendRaw(partition.buffer, key.data(), key.size());
-      AppendRaw(partition.buffer, value.data(), value.size());
-    }
-    if (!status) {
-      writePoisoned_.store(true, std::memory_order_release);
-      return status;
-    }
-
-    stagedEntryCount_.fetch_add(1, std::memory_order_relaxed);
     return Status::Ok();
   }
 
@@ -458,6 +475,65 @@ class Database::Impl {
     uint64_t keyHash = 0;
     size_t entryIndex = 0;
   };
+
+  Status StageRecordLocked(uint32_t partitionId, SpillPartition& partition, std::string_view column,
+                           uint64_t columnHash, uint64_t rowId, std::string_view key,
+                           uint64_t keyHash, std::span<const std::byte> value) {
+    detail::StageRecordHeader record;
+    record.columnHash = columnHash;
+    record.keyHash = keyHash;
+    record.rowId = rowId;
+    record.columnSize = static_cast<uint32_t>(column.size());
+    record.keySize = static_cast<uint32_t>(key.size());
+    record.valueSize = static_cast<uint32_t>(value.size());
+
+    uint64_t recordSize = sizeof(record);
+    if (!CheckedAdd(recordSize, column.size(), recordSize) ||
+        !CheckedAdd(recordSize, key.size(), recordSize) ||
+        !CheckedAdd(recordSize, value.size(), recordSize) ||
+        recordSize > std::numeric_limits<size_t>::max()) {
+      return Status::InvalidArgument("staged record is too large");
+    }
+
+    Status status = EnsureStageFileOpen(partitionId, partition);
+    if (!status) {
+      return status;
+    }
+
+    if (!partition.buffer.empty() &&
+        partition.buffer.size() + recordSize > options_.stageBufferBytes) {
+      status = FlushStageBuffer(partition);
+      if (!status) {
+        return status;
+      }
+    }
+
+    if (recordSize > options_.stageBufferBytes) {
+      std::vector<std::byte> packed;
+      packed.reserve(static_cast<size_t>(recordSize));
+      AppendRaw(packed, &record, sizeof(record));
+      AppendRaw(packed, column.data(), column.size());
+      AppendRaw(packed, key.data(), key.size());
+      AppendRaw(packed, value.data(), value.size());
+      status = detail::WriteAllAt(partition.file.Get(), packed.data(), packed.size(),
+                                  partition.persistedSize);
+      if (status) {
+        partition.persistedSize += packed.size();
+      }
+    } else {
+      partition.buffer.reserve(options_.stageBufferBytes);
+      AppendRaw(partition.buffer, &record, sizeof(record));
+      AppendRaw(partition.buffer, column.data(), column.size());
+      AppendRaw(partition.buffer, key.data(), key.size());
+      AppendRaw(partition.buffer, value.data(), value.size());
+    }
+    if (!status) {
+      return status;
+    }
+
+    stagedEntryCount_.fetch_add(1, std::memory_order_relaxed);
+    return Status::Ok();
+  }
 
   Status OpenInternal(const std::filesystem::path& directory, const DatabaseOptions& options,
                       bool readOnly) {
@@ -1811,6 +1887,12 @@ Status Database::Put(std::string_view column, uint64_t rowId, std::string_view k
 Status Database::Put(std::string_view column, uint64_t rowId, std::string_view key,
                      std::string_view value) {
   return Put(column, rowId, key, AsBytes(value));
+}
+
+Status Database::PutRowStructs(std::string_view column, uint64_t rowId,
+                               std::span<const RowStructEntry> entries) {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->PutRowStructs(column, rowId, entries);
 }
 
 Status Database::Get(std::string_view column, std::string_view key,

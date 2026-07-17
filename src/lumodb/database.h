@@ -27,6 +27,11 @@ struct WriteProgress {
 
 using WriteProgressCallback = std::function<void(const WriteProgress&)>;
 
+struct RowStructEntry {
+  std::string_view key;
+  std::span<const std::byte> flatBufferBytes;
+};
+
 // Options used when a database is first created. Routing parameters are stored
 // in the database and are reused on every subsequent read-write or read-only
 // open, so readers never need to repeat these values.
@@ -105,6 +110,10 @@ class Database {
   Status Put(std::string_view column, uint64_t rowId, std::string_view key,
              std::span<const std::byte> value);
   Status Put(std::string_view column, uint64_t rowId, std::string_view key, std::string_view value);
+  // Batch form of explicit-row Put. Entries are staged in input order, so the
+  // last duplicate key in the batch wins at Flush().
+  Status PutRowStructs(std::string_view column, uint64_t rowId,
+                       std::span<const RowStructEntry> entries);
   Status Get(std::string_view column, uint64_t rowId, std::string_view key,
              std::vector<std::byte>& value) const;
   Status Get(std::string_view column, uint64_t rowId, std::string_view key,

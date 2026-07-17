@@ -6,6 +6,7 @@ public data API supports automatic and caller-selected row routing:
 ```cpp
 Put(column, key, value);         // Automatic row.
 Put(column, rowId, key, value);  // Explicit row.
+PutRowStructs(column, rowId, entries);  // Explicit-row batch.
 Flush();
 Get(column, key, value);
 Get(column, rowId, key, value);
@@ -17,8 +18,9 @@ sequential write and compact read engine, can be selected independently per
 column, and may even coexist within one column without collisions. Callers never
 choose a hash bucket count.
 
-The old object, `PutUniqueStructs`, `PutStructs`, and `PutRowStructs` APIs are not
-part of this format.
+The old object, `PutUniqueStructs`, and `PutStructs` APIs are not part of this
+format. `RowStructEntry` and `PutRowStructs` remain available for efficient
+caller-routed batch writes.
 
 ## Creating and reading a database
 
@@ -61,7 +63,8 @@ Binary values use `std::span<const std::byte>` and
 `2^63`; `expectedExplicitRowCount` is the expected total number of explicit
 rows across all columns and pre-sizes the outer index. The optional
 `expectedExplicitEntryCount` helps choose spill parallelism for explicit-heavy
-builds.
+builds. `PutRowStructs` stages all entries under one row/partition lock and
+preserves input order, so the last duplicate key in a batch wins at `Flush`.
 
 `Put` is safe to call concurrently. `Flush`, `Close`, and `Get` must not race
 with Put calls. A batch becomes readable and durable at `Flush`; `Get` returns

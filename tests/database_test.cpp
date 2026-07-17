@@ -1,3 +1,4 @@
+#include <array>
 #include <atomic>
 #include <bit>
 #include <filesystem>
@@ -124,6 +125,89 @@ TEST(DatabaseTest, DuplicateHeavyBatchSizesRowFromUniqueKeys) {
   EXPECT_LT(std::filesystem::file_size(directory / "row_values-000.lumorv"), 64ULL * 1024);
 }
 
+TEST(DatabaseTest, PutRowStructsStagesBinaryBatchAndPersistsUpdates) {
+  const auto directory = LumoDB::test::MakeTestDirectory("row-struct-batch");
+  LumoDB::DatabaseOptions options = TestOptions(10'000);
+  options.stageBufferBytes = 4 * 1024;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  const std::vector<std::byte> binary = {std::byte{0x00}, std::byte{0x7f}, std::byte{0xff}};
+  const std::vector<std::byte> duplicateOld = LumoDB::test::MakeBytes("old");
+  const std::vector<std::byte> duplicateNew = LumoDB::test::MakeBytes("new");
+  const std::vector<std::byte> largeValue(128 * 1024, std::byte{0x5a});
+  const std::vector<std::byte> emptyValue;
+  const std::vector<LumoDB::RowStructEntry> entries = {
+      {.key = "binary", .flatBufferBytes = binary},
+      {.key = "duplicate", .flatBufferBytes = duplicateOld},
+      {.key = "large", .flatBufferBytes = largeValue},
+      {.key = "duplicate", .flatBufferBytes = duplicateNew},
+      {.key = "empty", .flatBufferBytes = emptyValue},
+  };
+
+  ASSERT_OK(database.PutRowStructs("mixed-batch", 7, entries));
+  {
+    const std::vector<std::byte> transientValue = LumoDB::test::MakeBytes("copied-immediately");
+    const std::array<LumoDB::RowStructEntry, 1> transientEntries = {
+        LumoDB::RowStructEntry{.key = "transient", .flatBufferBytes = transientValue},
+    };
+    ASSERT_OK(database.PutRowStructs("mixed-batch", 7, transientEntries));
+  }
+  ASSERT_OK(database.Put("mixed-batch", 7, "single", "single-explicit"));
+  ASSERT_OK(database.Put("mixed-batch", "duplicate", "automatic-value"));
+  EXPECT_TRUE(database.HasUncommittedWrites());
+
+  std::vector<std::byte> value;
+  EXPECT_EQ(database.Get("mixed-batch", 7, "binary", value).Code(),
+            LumoDB::StatusCode::kInvalidArgument);
+  ASSERT_OK(database.Flush());
+  EXPECT_EQ(database.EntryCount(), 7);
+  EXPECT_EQ(database.RowCount(), 2);
+
+  ASSERT_OK(database.Get("mixed-batch", 7, "binary", value));
+  EXPECT_EQ(value, binary);
+  ASSERT_OK(database.Get("mixed-batch", 7, "duplicate", value));
+  EXPECT_EQ(value, duplicateNew);
+  ASSERT_OK(database.Get("mixed-batch", 7, "large", value));
+  EXPECT_EQ(value, largeValue);
+  ASSERT_OK(database.Get("mixed-batch", 7, "empty", value));
+  EXPECT_TRUE(value.empty());
+  ASSERT_OK(database.Get("mixed-batch", 7, "single", value));
+  EXPECT_EQ(LumoDB::test::BytesToString(value), "single-explicit");
+  ASSERT_OK(database.Get("mixed-batch", 7, "transient", value));
+  EXPECT_EQ(LumoDB::test::BytesToString(value), "copied-immediately");
+  ASSERT_OK(database.Get("mixed-batch", "duplicate", value));
+  EXPECT_EQ(LumoDB::test::BytesToString(value), "automatic-value");
+
+  const std::vector<std::byte> updated = LumoDB::test::MakeBytes("updated");
+  const std::vector<std::byte> added = LumoDB::test::MakeBytes("added");
+  const std::array<LumoDB::RowStructEntry, 2> updates = {
+      LumoDB::RowStructEntry{.key = "duplicate", .flatBufferBytes = updated},
+      LumoDB::RowStructEntry{.key = "added", .flatBufferBytes = added},
+  };
+  ASSERT_OK(database.PutRowStructs("mixed-batch", 7, updates));
+  ASSERT_OK(database.Flush());
+  EXPECT_EQ(database.EntryCount(), 8);
+  ASSERT_OK(database.Get("mixed-batch", 7, "duplicate", value));
+  EXPECT_EQ(value, updated);
+  ASSERT_OK(database.Get("mixed-batch", 7, "binary", value));
+  EXPECT_EQ(value, binary);
+
+  const std::vector<std::byte> closeFlushed = LumoDB::test::MakeBytes("close-flushed");
+  const std::array<LumoDB::RowStructEntry, 1> closeEntries = {
+      LumoDB::RowStructEntry{.key = "close", .flatBufferBytes = closeFlushed},
+  };
+  ASSERT_OK(database.PutRowStructs("mixed-batch", 8, closeEntries));
+  ASSERT_OK(database.Close());
+  ASSERT_OK(database.OpenReadOnly(directory));
+  ASSERT_OK(database.Get("mixed-batch", 7, "added", value));
+  EXPECT_EQ(value, added);
+  ASSERT_OK(database.Get("mixed-batch", 8, "close", value));
+  EXPECT_EQ(value, closeFlushed);
+  EXPECT_EQ(database.PutRowStructs("mixed-batch", 7, updates).Code(),
+            LumoDB::StatusCode::kInvalidArgument);
+}
+
 TEST(DatabaseTest, AutomaticAndExplicitRowsCanCoexist) {
   const auto directory = LumoDB::test::MakeTestDirectory("mixed-row-routing");
   LumoDB::Database database;
@@ -211,6 +295,57 @@ TEST(DatabaseTest, PutIsThreadSafe) {
   }
 }
 
+TEST(DatabaseTest, PutRowStructsIsThreadSafeAcrossConcurrentBatches) {
+  const auto directory = LumoDB::test::MakeTestDirectory("parallel-row-struct-batches");
+  constexpr uint32_t kThreads = 8;
+  constexpr uint32_t kBatchesPerThread = 100;
+  constexpr uint32_t kEntriesPerBatch = 4;
+  constexpr uint32_t kEntryCount = kThreads * kBatchesPerThread * kEntriesPerBatch;
+  LumoDB::DatabaseOptions options = TestOptions(kEntryCount);
+  options.writerThreadCount = kThreads;
+  options.expectedExplicitRowCount = kThreads;
+  options.expectedExplicitEntryCount = kEntryCount;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> threads;
+  for (uint32_t threadId = 0; threadId < kThreads; ++threadId) {
+    threads.emplace_back([&, threadId] {
+      for (uint32_t batch = 0; batch < kBatchesPerThread; ++batch) {
+        std::array<std::string, kEntriesPerBatch> keys;
+        std::array<std::vector<std::byte>, kEntriesPerBatch> values;
+        std::array<LumoDB::RowStructEntry, kEntriesPerBatch> entries;
+        for (uint32_t entry = 0; entry < kEntriesPerBatch; ++entry) {
+          keys[entry] = "key-" + std::to_string(threadId) + "-" + std::to_string(batch) + "-" +
+                        std::to_string(entry);
+          values[entry] = LumoDB::test::MakeBytes("value-" + std::to_string(batch) + "-" +
+                                                  std::to_string(entry));
+          entries[entry] = {.key = keys[entry], .flatBufferBytes = values[entry]};
+        }
+        if (!database.PutRowStructs("parallel-batches", threadId, entries)) {
+          failed.store(true, std::memory_order_relaxed);
+          return;
+        }
+      }
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  ASSERT_FALSE(failed.load(std::memory_order_relaxed));
+  ASSERT_OK(database.Flush());
+  EXPECT_EQ(database.EntryCount(), kEntryCount);
+  EXPECT_EQ(database.RowCount(), kThreads);
+
+  for (uint32_t threadId = 0; threadId < kThreads; ++threadId) {
+    std::vector<std::byte> value;
+    ASSERT_OK(database.Get("parallel-batches", threadId,
+                           "key-" + std::to_string(threadId) + "-99-3", value));
+    EXPECT_EQ(LumoDB::test::BytesToString(value), "value-99-3");
+  }
+}
+
 TEST(DatabaseTest, RowIndexGrowsWhenColumnEstimateIsExceeded) {
   const auto directory = LumoDB::test::MakeTestDirectory("index-growth");
   LumoDB::DatabaseOptions options = TestOptions(1'000);
@@ -284,8 +419,14 @@ TEST(StorageFormatTest, HotBucketsAreCompact) {
 TEST(DatabaseTest, ReportsInvalidStateAndArguments) {
   LumoDB::Database database;
   std::string value;
+  const std::vector<std::byte> rowValue = LumoDB::test::MakeBytes("row-value");
+  const std::array<LumoDB::RowStructEntry, 1> validRowEntries = {
+      LumoDB::RowStructEntry{.key = "key", .flatBufferBytes = rowValue},
+  };
   EXPECT_EQ(database.Get("column", "key", value).Code(), LumoDB::StatusCode::kNotOpen);
   EXPECT_EQ(database.Put("column", "key", "value").Code(), LumoDB::StatusCode::kNotOpen);
+  EXPECT_EQ(database.PutRowStructs("column", 0, validRowEntries).Code(),
+            LumoDB::StatusCode::kNotOpen);
 
   const auto directory = LumoDB::test::MakeTestDirectory("arguments");
   ASSERT_OK(database.Open(directory, TestOptions(100)));
@@ -294,6 +435,18 @@ TEST(DatabaseTest, ReportsInvalidStateAndArguments) {
   EXPECT_EQ(database.Put("column", 1ULL << 63, "key", "value").Code(),
             LumoDB::StatusCode::kInvalidArgument);
   EXPECT_EQ(database.Get("column", "missing", value).Code(), LumoDB::StatusCode::kNotFound);
+  EXPECT_EQ(database.PutRowStructs("column", 0, {}).Code(), LumoDB::StatusCode::kInvalidArgument);
+  EXPECT_EQ(database.PutRowStructs("", 0, validRowEntries).Code(),
+            LumoDB::StatusCode::kInvalidArgument);
+  EXPECT_EQ(database.PutRowStructs("column", 1ULL << 63, validRowEntries).Code(),
+            LumoDB::StatusCode::kInvalidArgument);
+  const std::array<LumoDB::RowStructEntry, 2> partiallyInvalidEntries = {
+      validRowEntries.front(),
+      LumoDB::RowStructEntry{.key = "", .flatBufferBytes = rowValue},
+  };
+  EXPECT_EQ(database.PutRowStructs("column", 0, partiallyInvalidEntries).Code(),
+            LumoDB::StatusCode::kInvalidArgument);
+  EXPECT_FALSE(database.HasUncommittedWrites());
 
   LumoDB::DatabaseOptions nonFiniteOptions = TestOptions(100);
   nonFiniteOptions.maxLoadFactor = std::numeric_limits<double>::quiet_NaN();
