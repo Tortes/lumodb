@@ -1369,7 +1369,7 @@ class Database::Impl {
     };
     const uint64_t initialEntryEstimate =
         std::min<uint64_t>({entries.size(), kMaximumDedupPresizeEntries,
-                            RoutingTargetEntries(IndexHeader()->targetEntriesPerRow)});
+                            RoutingTargetEntries(targetEntriesPerRow_)});
     const uint64_t initialBucketCount = bucketCountForEntries(initialEntryEstimate);
     if (initialBucketCount == 0 || initialBucketCount > std::numeric_limits<uint32_t>::max()) {
       return Status::InvalidArgument("row local index is too large");
@@ -1769,6 +1769,7 @@ class Database::Impl {
     routingSeed_ = header.routingSeed;
     expectedAutomaticColumnCount_ = header.expectedAutomaticColumnCount;
     expectedExplicitRowCount_ = header.expectedExplicitRowCount;
+    targetEntriesPerRow_ = header.targetEntriesPerRow;
     shardCount_ = header.shardCount;
     spillPartitionCount_ = header.spillPartitionCount;
   }
@@ -1804,6 +1805,7 @@ class Database::Impl {
     routingSeed_ = detail::kRoutingSeed;
     expectedAutomaticColumnCount_ = 1;
     expectedExplicitRowCount_ = 0;
+    targetEntriesPerRow_ = 0;
     shardCount_ = 0;
     spillPartitionCount_ = 0;
   }
@@ -1828,6 +1830,7 @@ class Database::Impl {
   uint64_t routingSeed_ = detail::kRoutingSeed;
   uint32_t expectedAutomaticColumnCount_ = 1;
   uint64_t expectedExplicitRowCount_ = 0;
+  uint32_t targetEntriesPerRow_ = 0;
   uint32_t shardCount_ = 0;
   uint32_t spillPartitionCount_ = 0;
   bool open_ = false;
@@ -1926,6 +1929,12 @@ Status Database::Get(std::string_view column, uint64_t rowId, std::string_view k
   }
   value.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   return Status::Ok();
+}
+
+Status Database::GetRowStruct(std::string_view column, uint64_t rowId, std::string_view key,
+                              std::vector<std::byte>& flatBufferBytes) const {
+  return impl_ == nullptr ? Status::NotOpen("database is not open")
+                          : impl_->Get(column, rowId, key, flatBufferBytes);
 }
 
 bool Database::IsOpen() const { return impl_ != nullptr && impl_->IsOpen(); }

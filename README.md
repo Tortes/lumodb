@@ -10,6 +10,7 @@ PutRowStructs(column, rowId, entries);  // Explicit-row batch.
 Flush();
 Get(column, key, value);
 Get(column, rowId, key, value);
+GetRowStruct(column, rowId, key, value);  // Compatible explicit-row lookup.
 ```
 
 Automatic columns provide their expected scale and let LumoDB choose a stable
@@ -51,6 +52,8 @@ db.Flush();
 std::string value;
 db.Get("symbols", "name", value);
 db.Get("syntax", 42, "node-name", value);
+std::vector<std::byte> flatBufferBytes;
+db.GetRowStruct("syntax", 42, "node-name", flatBufferBytes);
 db.Close();
 
 // Routing options are stored in row_index.lumori.
@@ -65,6 +68,8 @@ rows across all columns and pre-sizes the outer index. The optional
 `expectedExplicitEntryCount` helps choose spill parallelism for explicit-heavy
 builds. `PutRowStructs` stages all entries under one row/partition lock and
 preserves input order, so the last duplicate key in a batch wins at `Flush`.
+`GetRowStruct` restores the legacy explicit-row name and directly probes the
+specified row; it is equivalent to the explicit-row `Get` overload.
 
 `Put` is safe to call concurrently. `Flush`, `Close`, and `Get` must not race
 with Put calls. A batch becomes readable and durable at `Flush`; `Get` returns

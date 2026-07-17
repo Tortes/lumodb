@@ -118,6 +118,10 @@ class Database {
              std::vector<std::byte>& value) const;
   Status Get(std::string_view column, uint64_t rowId, std::string_view key,
              std::string& value) const;
+  // Compatibility name for direct explicit-row lookup. This probes only the
+  // caller-selected row and does not perform automatic row routing.
+  Status GetRowStruct(std::string_view column, uint64_t rowId, std::string_view key,
+                      std::vector<std::byte>& flatBufferBytes) const;
 
   [[nodiscard]] bool IsOpen() const;
   [[nodiscard]] bool HasUncommittedWrites() const;

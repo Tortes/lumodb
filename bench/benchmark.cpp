@@ -172,7 +172,7 @@ int main(int argc, char** argv) {
     const LumoDB::Status status =
         arguments.explicitRows == 0
             ? database.Get("objects", Key(index), value)
-            : database.Get("objects", index % arguments.explicitRows, Key(index), value);
+            : database.GetRowStruct("objects", index % arguments.explicitRows, Key(index), value);
     Check(status, "Get");
     const auto end = std::chrono::steady_clock::now();
     if (value != payload) {

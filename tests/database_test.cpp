@@ -208,6 +208,45 @@ TEST(DatabaseTest, PutRowStructsStagesBinaryBatchAndPersistsUpdates) {
             LumoDB::StatusCode::kInvalidArgument);
 }
 
+TEST(DatabaseTest, GetRowStructDirectlySelectsExplicitRow) {
+  const auto directory = LumoDB::test::MakeTestDirectory("get-row-struct");
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, TestOptions(1'000)));
+
+  const std::vector<std::byte> rowSeven = LumoDB::test::MakeBytes("row-seven");
+  const std::vector<std::byte> rowEight = {std::byte{0x00}, std::byte{0xff}};
+  const std::array<LumoDB::RowStructEntry, 1> entriesSeven = {
+      LumoDB::RowStructEntry{.key = "same-key", .flatBufferBytes = rowSeven},
+  };
+  const std::array<LumoDB::RowStructEntry, 1> entriesEight = {
+      LumoDB::RowStructEntry{.key = "same-key", .flatBufferBytes = rowEight},
+  };
+  ASSERT_OK(database.PutRowStructs("rows", 7, entriesSeven));
+  ASSERT_OK(database.PutRowStructs("rows", 8, entriesEight));
+  ASSERT_OK(database.Put("rows", "same-key", "automatic"));
+
+  std::vector<std::byte> value = LumoDB::test::MakeBytes("stale");
+  EXPECT_EQ(database.GetRowStruct("rows", 7, "same-key", value).Code(),
+            LumoDB::StatusCode::kInvalidArgument);
+  EXPECT_TRUE(value.empty());
+  ASSERT_OK(database.Flush());
+
+  ASSERT_OK(database.GetRowStruct("rows", 7, "same-key", value));
+  EXPECT_EQ(value, rowSeven);
+  ASSERT_OK(database.GetRowStruct("rows", 8, "same-key", value));
+  EXPECT_EQ(value, rowEight);
+  EXPECT_EQ(database.GetRowStruct("rows", 9, "same-key", value).Code(),
+            LumoDB::StatusCode::kNotFound);
+  EXPECT_TRUE(value.empty());
+  EXPECT_EQ(database.GetRowStruct("rows", 1ULL << 63, "same-key", value).Code(),
+            LumoDB::StatusCode::kInvalidArgument);
+
+  ASSERT_OK(database.Close());
+  ASSERT_OK(database.OpenReadOnly(directory));
+  ASSERT_OK(database.GetRowStruct("rows", 7, "same-key", value));
+  EXPECT_EQ(value, rowSeven);
+}
+
 TEST(DatabaseTest, AutomaticAndExplicitRowsCanCoexist) {
   const auto directory = LumoDB::test::MakeTestDirectory("mixed-row-routing");
   LumoDB::Database database;
@@ -426,6 +465,9 @@ TEST(DatabaseTest, ReportsInvalidStateAndArguments) {
   EXPECT_EQ(database.Get("column", "key", value).Code(), LumoDB::StatusCode::kNotOpen);
   EXPECT_EQ(database.Put("column", "key", "value").Code(), LumoDB::StatusCode::kNotOpen);
   EXPECT_EQ(database.PutRowStructs("column", 0, validRowEntries).Code(),
+            LumoDB::StatusCode::kNotOpen);
+  std::vector<std::byte> bytes;
+  EXPECT_EQ(database.GetRowStruct("column", 0, "key", bytes).Code(),
             LumoDB::StatusCode::kNotOpen);
 
   const auto directory = LumoDB::test::MakeTestDirectory("arguments");
