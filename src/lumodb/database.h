@@ -54,17 +54,19 @@ struct DatabaseOptions {
   uint32_t averageKeyBytes = 16;
   uint32_t averageValueBytes = 256;
 
-  // Rows are selected from 75%-full power-of-two local hash tables. The byte
-  // target may reduce maxEntriesPerRow for large values.
+  // Rows use grouped control-byte hash tables with an upper target near 87.5%.
+  // The byte target may reduce maxEntriesPerRow for large values.
   uint64_t targetRowBytes = 64ULL * 1024 * 1024;
   uint32_t maxEntriesPerRow = 12'288;
 
-  // Zero means auto. Write concurrency is bounded by both writerThreadCount
-  // and memoryBudgetBytes during Flush().
+  // Zero means auto. Up to half of memoryBudgetBytes is used for RAM-first
+  // staging; a partition spills sequentially only after its share is full.
+  // Write concurrency is also bounded by this budget during Flush().
   uint32_t writerThreadCount = 0;
   uint32_t rowShardCount = 0;
   uint32_t spillPartitionCount = 0;
   uint64_t memoryBudgetBytes = 64ULL * 1024 * 1024 * 1024;
+  // Buffered write size after a staging partition has spilled to disk.
   uint32_t stageBufferBytes = 256 * 1024;
   double maxLoadFactor = 0.80;
 

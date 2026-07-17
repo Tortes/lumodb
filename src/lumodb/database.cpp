@@ -18,6 +18,12 @@
 #include <utility>
 #include <vector>
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 #include "lumodb/file.h"
 #include "lumodb/hash.h"
 #include "lumodb/storage_format.h"
@@ -34,7 +40,10 @@ constexpr uint32_t kMinimumStageBuffer = 4 * 1024;
 constexpr uint32_t kMaximumStageBuffer = 16 * 1024 * 1024;
 constexpr uint32_t kMaximumDedupPresizeEntries = 64 * 1024;
 constexpr size_t kMaximumBatchRoutingEntries = 64 * 1024;
-constexpr double kRowLoadFactor = 0.75;
+constexpr uint32_t kControlGroupWidth = 16;
+constexpr uint32_t kMaximumPrefixCount = 254;
+constexpr std::array<uint32_t, 3> kCandidatePrefixLengths = {32, 16, 8};
+constexpr double kRowLoadFactor = 0.875;
 constexpr uint64_t kExplicitRowBit = 1ULL << 63;
 constexpr std::string_view kIncompleteMarkerName = "build.incomplete";
 constexpr std::string_view kIncompleteMarkerTempName = "build.incomplete.tmp";
@@ -76,9 +85,87 @@ uint64_t DivideRoundUp(uint64_t value, uint64_t divisor) {
 
 uint64_t AlignUp8(uint64_t value) { return (value + 7) & ~uint64_t{7}; }
 
-uint32_t KeyFingerprint(uint64_t keyHash) {
-  const uint32_t fingerprint = static_cast<uint32_t>(keyHash >> 32);
+uint64_t AlignUp64(uint64_t value) { return (value + 63) & ~uint64_t{63}; }
+
+uint8_t KeyFingerprint(uint64_t keyHash) {
+  const uint8_t fingerprint = static_cast<uint8_t>(keyHash >> 56);
   return fingerprint == 0 ? 1 : fingerprint;
+}
+
+uint16_t ControlMatchMask(const std::byte* controls, uint8_t value) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  const uint8x16_t group = vld1q_u8(reinterpret_cast<const uint8_t*>(controls));
+  const uint8x16_t matches = vceqq_u8(group, vdupq_n_u8(value));
+  const uint8x16_t bits = vshrq_n_u8(matches, 7);
+  static constexpr std::array<uint8_t, 16> kBitWeights = {1, 2, 4, 8, 16, 32, 64, 128,
+                                                          1, 2, 4, 8, 16, 32, 64, 128};
+  const uint8x16_t weighted =
+      vmulq_u8(bits, vld1q_u8(reinterpret_cast<const uint8_t*>(kBitWeights.data())));
+  const uint16_t low = vaddv_u8(vget_low_u8(weighted));
+  const uint16_t high = vaddv_u8(vget_high_u8(weighted));
+  return static_cast<uint16_t>(low | (high << 8));
+#elif defined(__SSE2__)
+  const __m128i group =
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(static_cast<const void*>(controls)));
+  const __m128i matches = _mm_cmpeq_epi8(group, _mm_set1_epi8(static_cast<char>(value)));
+  return static_cast<uint16_t>(_mm_movemask_epi8(matches));
+#else
+  uint16_t matches = 0;
+  for (uint32_t lane = 0; lane < kControlGroupWidth; ++lane) {
+    if (std::to_integer<uint8_t>(controls[lane]) == value) {
+      matches |= static_cast<uint16_t>(1U << lane);
+    }
+  }
+  return matches;
+#endif
+}
+
+uint16_t InterleavedControlMatchMask(const std::byte* buckets, uint8_t value) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  // vld4 deinterleaves sixteen {control, offset[0], offset[1], offset[2]}
+  // buckets while loading exactly one 64-byte cache line.
+  const uint8x16x4_t group = vld4q_u8(reinterpret_cast<const uint8_t*>(buckets));
+  const uint8x16_t matches = vceqq_u8(group.val[0], vdupq_n_u8(value));
+  const uint8x16_t bits = vshrq_n_u8(matches, 7);
+  static constexpr std::array<uint8_t, 16> kBitWeights = {1, 2, 4, 8, 16, 32, 64, 128,
+                                                          1, 2, 4, 8, 16, 32, 64, 128};
+  const uint8x16_t weighted =
+      vmulq_u8(bits, vld1q_u8(reinterpret_cast<const uint8_t*>(kBitWeights.data())));
+  const uint16_t low = vaddv_u8(vget_low_u8(weighted));
+  const uint16_t high = vaddv_u8(vget_high_u8(weighted));
+  return static_cast<uint16_t>(low | (high << 8));
+#else
+  uint16_t matches = 0;
+  for (uint32_t lane = 0; lane < kControlGroupWidth; ++lane) {
+    if (std::to_integer<uint8_t>(buckets[lane * 4]) == value) {
+      matches |= static_cast<uint16_t>(1U << lane);
+    }
+  }
+  return matches;
+#endif
+}
+
+uint32_t PackedByteCount(uint32_t symbolCount, uint8_t bitsPerSymbol) {
+  return static_cast<uint32_t>((static_cast<uint64_t>(symbolCount) * bitsPerSymbol + 7) / 8);
+}
+
+void WriteRecordOffset(std::byte* output, uint32_t value, uint8_t width) {
+  output[0] = static_cast<std::byte>(value & 0xff);
+  output[1] = static_cast<std::byte>((value >> 8) & 0xff);
+  output[2] = static_cast<std::byte>((value >> 16) & 0xff);
+  if (width == 4) {
+    output[3] = static_cast<std::byte>((value >> 24) & 0xff);
+  }
+}
+
+uint32_t ReadRecordOffset(const std::byte* input, uint8_t width) {
+  uint32_t value = std::to_integer<uint8_t>(input[0]) |
+                   (static_cast<uint32_t>(std::to_integer<uint8_t>(input[1])) << 8) |
+                   (static_cast<uint32_t>(std::to_integer<uint8_t>(input[2])) << 16);
+  if (width == 4) {
+    value |= static_cast<uint32_t>(std::to_integer<uint8_t>(input[3])) << 24;
+  }
+  return value;
 }
 
 size_t Varint32Size(uint32_t value) {
@@ -244,35 +331,52 @@ class Database::Impl {
     }
 
     for (size_t chunkBegin = 0; chunkBegin < entries.size();) {
-      const size_t chunkSize =
-          std::min(kMaximumBatchRoutingEntries, entries.size() - chunkBegin);
+      const size_t chunkSize = std::min(kMaximumBatchRoutingEntries, entries.size() - chunkBegin);
       const size_t chunkEnd = chunkBegin + chunkSize;
       for (size_t index = chunkBegin; index < chunkEnd; ++index) {
         const uint64_t keyHash = NormalizeHash(detail::HashString(entries[index].key));
         const uint64_t routeHash =
             detail::MixHashes(detail::MixHashes(columnHash, keyHash), RoutingSeed());
         const uint64_t rowId = routeHash % routeCount_;
-        const uint32_t partitionId = static_cast<uint32_t>(
-            detail::MixHashes(columnHash, rowId) % spillPartitions_.size());
+        const uint32_t partitionId =
+            static_cast<uint32_t>(detail::MixHashes(columnHash, rowId) % spillPartitions_.size());
         partitionEntries[partitionId].push_back(
             RoutedEntry{.index = index, .keyHash = keyHash, .rowId = rowId});
       }
 
       for (uint32_t partitionId = 0; partitionId < partitionEntries.size(); ++partitionId) {
-        const std::vector<RoutedEntry>& routedEntries = partitionEntries[partitionId];
+        std::vector<RoutedEntry>& routedEntries = partitionEntries[partitionId];
         if (routedEntries.empty()) {
           continue;
         }
+        std::stable_sort(
+            routedEntries.begin(), routedEntries.end(),
+            [](const RoutedEntry& lhs, const RoutedEntry& rhs) { return lhs.rowId < rhs.rowId; });
         SpillPartition& partition = *spillPartitions_[partitionId];
         std::lock_guard partitionLock(partition.mutex);
-        for (const RoutedEntry& routed : routedEntries) {
-          const StructEntry& entry = entries[routed.index];
-          status = StageRecordLocked(partitionId, partition, column, columnHash, routed.rowId,
-                                     entry.key, routed.keyHash, entry.flatBufferBytes);
+        std::vector<StageInput> stageEntries;
+        size_t groupBegin = 0;
+        while (groupBegin < routedEntries.size()) {
+          size_t groupEnd = groupBegin + 1;
+          while (groupEnd < routedEntries.size() &&
+                 routedEntries[groupEnd].rowId == routedEntries[groupBegin].rowId) {
+            ++groupEnd;
+          }
+          stageEntries.clear();
+          stageEntries.reserve(groupEnd - groupBegin);
+          for (size_t index = groupBegin; index < groupEnd; ++index) {
+            const RoutedEntry& routed = routedEntries[index];
+            const StructEntry& entry = entries[routed.index];
+            stageEntries.push_back(StageInput{
+                .key = entry.key, .value = entry.flatBufferBytes, .keyHash = routed.keyHash});
+          }
+          status = StageChunkLocked(partitionId, partition, column, columnHash,
+                                    routedEntries[groupBegin].rowId, stageEntries);
           if (!status) {
             writePoisoned_.store(true, std::memory_order_release);
             return status;
           }
+          groupBegin = groupEnd;
         }
       }
       for (auto& partitionGroup : partitionEntries) {
@@ -315,10 +419,20 @@ class Database::Impl {
         detail::MixHashes(columnHash, internalRowId) % spillPartitions_.size());
     SpillPartition& partition = *spillPartitions_[partitionId];
     std::lock_guard partitionLock(partition.mutex);
-    for (const RowStructEntry& entry : entries) {
-      const uint64_t keyHash = NormalizeHash(detail::HashString(entry.key));
-      status = StageRecordLocked(partitionId, partition, column, columnHash, internalRowId,
-                                 entry.key, keyHash, entry.flatBufferBytes);
+    std::vector<StageInput> stageEntries;
+    stageEntries.reserve(std::min(kMaximumBatchRoutingEntries, entries.size()));
+    for (size_t chunkBegin = 0; chunkBegin < entries.size();
+         chunkBegin += kMaximumBatchRoutingEntries) {
+      const size_t chunkEnd = std::min(entries.size(), chunkBegin + kMaximumBatchRoutingEntries);
+      stageEntries.clear();
+      for (size_t index = chunkBegin; index < chunkEnd; ++index) {
+        const RowStructEntry& entry = entries[index];
+        stageEntries.push_back(StageInput{.key = entry.key,
+                                          .value = entry.flatBufferBytes,
+                                          .keyHash = NormalizeHash(detail::HashString(entry.key))});
+      }
+      status =
+          StageChunkLocked(partitionId, partition, column, columnHash, internalRowId, stageEntries);
       if (!status) {
         writePoisoned_.store(true, std::memory_order_release);
         return status;
@@ -361,8 +475,9 @@ class Database::Impl {
 
     SpillPartition& partition = *spillPartitions_[partitionId];
     std::lock_guard partitionLock(partition.mutex);
-    status =
-        StageRecordLocked(partitionId, partition, column, columnHash, rowId, key, keyHash, value);
+    const std::array<StageInput, 1> entry = {
+        StageInput{.key = key, .value = value, .keyHash = keyHash}};
+    status = StageChunkLocked(partitionId, partition, column, columnHash, rowId, entry);
     if (!status) {
       writePoisoned_.store(true, std::memory_order_release);
     }
@@ -395,7 +510,7 @@ class Database::Impl {
         value.size() > std::numeric_limits<uint32_t>::max()) {
       return Status::InvalidArgument("column, key, and value must each be smaller than 4 GiB");
     }
-    uint64_t recordSize = sizeof(detail::StageRecordHeader);
+    uint64_t recordSize = sizeof(detail::StageChunkHeader) + sizeof(uint64_t) + 10;
     if (!CheckedAdd(recordSize, column.size(), recordSize) ||
         !CheckedAdd(recordSize, key.size(), recordSize) ||
         !CheckedAdd(recordSize, value.size(), recordSize) ||
@@ -449,74 +564,167 @@ class Database::Impl {
       return Status::NotFound("key not found");
     }
 
-    const uint64_t bucketOffset =
+    const uint64_t metadataOffset =
         AlignUp8(sizeof(detail::RowBlockHeader) + lookup.header.columnSize);
+    const uint64_t localIndexOffset =
+        AlignUp64(metadataOffset + lookup.header.keyMetadataBytesSize);
+    const uint64_t offsetsOffset = localIndexOffset + lookup.header.bucketCount;
     const uint64_t recordsOffset =
-        bucketOffset +
-        static_cast<uint64_t>(lookup.header.bucketCount) * sizeof(detail::RowKeyBucket);
-    const uint64_t mask = lookup.header.bucketCount - 1;
-    const uint64_t start = keyHash & mask;
-    const uint32_t fingerprint = KeyFingerprint(keyHash);
+        localIndexOffset +
+        static_cast<uint64_t>(lookup.header.bucketCount) * (lookup.header.recordOffsetWidth + 1);
+    const RowShard& shard = *rowShards_[lookup.bucket.shardId];
+    const std::byte* mappedBlock = nullptr;
+    if (shard.map.IsMapped()) {
+      if (lookup.bucket.blockOffset > shard.map.Size() ||
+          lookup.header.blockSize > shard.map.Size() - lookup.bucket.blockOffset) {
+        return Status::Corruption("row block extends beyond its value file");
+      }
+      mappedBlock = static_cast<const std::byte*>(shard.map.Data()) + lookup.bucket.blockOffset;
+    }
 
-    for (uint64_t probe = 0; probe < lookup.header.bucketCount; ++probe) {
-      const uint64_t bucketIndex = (start + probe) & mask;
-      detail::RowKeyBucket bucket;
-      status = ReadRowAt(lookup.bucket.shardId, &bucket, sizeof(bucket),
-                         lookup.bucket.blockOffset + bucketOffset + bucketIndex * sizeof(bucket));
+    std::vector<std::byte> ownedMetadata;
+    std::span<const std::byte> metadataBytes;
+    if (mappedBlock != nullptr) {
+      metadataBytes = {mappedBlock + metadataOffset, lookup.header.keyMetadataBytesSize};
+    } else {
+      ownedMetadata.resize(lookup.header.keyMetadataBytesSize);
+      status = ReadRowAt(lookup.bucket.shardId, ownedMetadata.data(), ownedMetadata.size(),
+                         lookup.bucket.blockOffset + metadataOffset);
       if (!status) {
         return status;
       }
-      if (bucket.keyFingerprint == 0) {
+      metadataBytes = ownedMetadata;
+    }
+    KeyMetadataView metadata;
+    status = ParseKeyMetadata(metadataBytes, metadata);
+    if (!status) {
+      return status;
+    }
+
+    const uint8_t fingerprint = KeyFingerprint(keyHash);
+    const uint32_t groupCount = lookup.header.bucketCount / kControlGroupWidth;
+    const uint32_t startGroup = static_cast<uint32_t>(keyHash) & (groupCount - 1);
+    std::array<std::byte, kControlGroupWidth * 4> ownedIndexGroup{};
+    std::array<std::byte, 4> ownedOffset{};
+    std::array<std::byte, 11> ownedRecordHeader{};
+    std::vector<std::byte> ownedEncodedSuffix;
+    for (uint32_t groupProbe = 0; groupProbe < groupCount; ++groupProbe) {
+      const uint32_t groupIndex = (startGroup + groupProbe) & (groupCount - 1);
+      const uint32_t groupBase = groupIndex * kControlGroupWidth;
+      const bool interleaved = lookup.header.recordOffsetWidth == 3;
+      const size_t groupBytes = interleaved ? ownedIndexGroup.size() : kControlGroupWidth;
+      const uint64_t groupOffset =
+          localIndexOffset + static_cast<uint64_t>(groupBase) * (interleaved ? 4 : 1);
+      const std::byte* groupData = nullptr;
+      if (mappedBlock != nullptr) {
+        groupData = mappedBlock + groupOffset;
+      } else {
+        status = ReadRowAt(lookup.bucket.shardId, ownedIndexGroup.data(), groupBytes,
+                           lookup.bucket.blockOffset + groupOffset);
+        if (!status) {
+          return status;
+        }
+        groupData = ownedIndexGroup.data();
+      }
+      uint16_t matchingLanes = interleaved ? InterleavedControlMatchMask(groupData, fingerprint)
+                                           : ControlMatchMask(groupData, fingerprint);
+      while (matchingLanes != 0) {
+        const uint32_t lane = std::countr_zero(matchingLanes);
+        matchingLanes &= static_cast<uint16_t>(matchingLanes - 1);
+        const uint32_t bucketIndex = groupBase + lane;
+        const std::byte* offsetBytes = nullptr;
+        if (interleaved) {
+          offsetBytes = groupData + lane * 4 + 1;
+        } else if (mappedBlock != nullptr) {
+          offsetBytes = mappedBlock + offsetsOffset +
+                        static_cast<uint64_t>(bucketIndex) * lookup.header.recordOffsetWidth;
+        } else {
+          status =
+              ReadRowAt(lookup.bucket.shardId, ownedOffset.data(), lookup.header.recordOffsetWidth,
+                        lookup.bucket.blockOffset + offsetsOffset +
+                            static_cast<uint64_t>(bucketIndex) * lookup.header.recordOffsetWidth);
+          if (!status) {
+            return status;
+          }
+          offsetBytes = ownedOffset.data();
+        }
+        const uint32_t recordOffset =
+            ReadRecordOffset(offsetBytes, lookup.header.recordOffsetWidth);
+        RowRecordView record;
+        if (mappedBlock != nullptr) {
+          status = ParseRowRecord(std::span<const std::byte>(mappedBlock + recordsOffset,
+                                                             lookup.header.recordBytesSize),
+                                  recordOffset, metadata, record);
+        } else {
+          if (recordOffset >= lookup.header.recordBytesSize) {
+            return Status::Corruption("row bucket points outside its record region");
+          }
+          const size_t headerBytes = std::min<size_t>(ownedRecordHeader.size(),
+                                                      lookup.header.recordBytesSize - recordOffset);
+          status = ReadRowAt(lookup.bucket.shardId, ownedRecordHeader.data(), headerBytes,
+                             lookup.bucket.blockOffset + recordsOffset + recordOffset);
+          if (!status) {
+            return status;
+          }
+          size_t cursor = 0;
+          if (!ReadVarint32(ownedRecordHeader.data(), headerBytes, cursor, record.suffixSize) ||
+              !ReadVarint32(ownedRecordHeader.data(), headerBytes, cursor, record.valueSize)) {
+            return Status::Corruption("row record has invalid lengths");
+          }
+          if (metadata.header.prefixCount != 0) {
+            if (cursor >= headerBytes) {
+              return Status::Corruption("row record has no prefix ID");
+            }
+            record.prefixId = std::to_integer<uint8_t>(ownedRecordHeader[cursor++]);
+            if (record.prefixId > metadata.header.prefixCount) {
+              return Status::Corruption("row record has an invalid prefix ID");
+            }
+          }
+          record.encodedSuffixSize =
+              PackedByteCount(record.suffixSize, metadata.header.bitsPerSymbol);
+          const uint64_t recordEnd = static_cast<uint64_t>(recordOffset) + cursor +
+                                     record.encodedSuffixSize + record.valueSize;
+          if (recordEnd > lookup.header.recordBytesSize) {
+            return Status::Corruption("row record extends beyond its record region");
+          }
+          ownedEncodedSuffix.resize(record.encodedSuffixSize);
+          status =
+              ReadRowAt(lookup.bucket.shardId, ownedEncodedSuffix.data(), ownedEncodedSuffix.size(),
+                        lookup.bucket.blockOffset + recordsOffset + recordOffset + cursor);
+          if (!status) {
+            return status;
+          }
+          record.encodedSuffix = ownedEncodedSuffix.data();
+          record.value = nullptr;
+          record.endOffset = static_cast<uint32_t>(recordEnd);
+        }
+        if (!status) {
+          return status;
+        }
+        bool matches = false;
+        status = RecordKeyMatches(metadata, record, key, matches);
+        if (!status) {
+          return status;
+        }
+        if (!matches) {
+          continue;
+        }
+        value.resize(record.valueSize);
+        if (mappedBlock != nullptr) {
+          if (record.valueSize != 0) {
+            std::memcpy(value.data(), record.value, record.valueSize);
+          }
+          return Status::Ok();
+        }
+        const uint64_t valueOffset = record.endOffset - record.valueSize;
+        return ReadRowAt(lookup.bucket.shardId, value.data(), value.size(),
+                         lookup.bucket.blockOffset + recordsOffset + valueOffset);
+      }
+      const uint16_t emptyLanes =
+          interleaved ? InterleavedControlMatchMask(groupData, 0) : ControlMatchMask(groupData, 0);
+      if (emptyLanes != 0) {
         return Status::NotFound("key not found");
       }
-      if (bucket.keyFingerprint != fingerprint) {
-        continue;
-      }
-      if (bucket.recordOffset >= lookup.header.recordBytesSize) {
-        return Status::Corruption("row bucket points outside its block");
-      }
-
-      std::array<std::byte, 10> encodedLengths{};
-      const size_t encodedBytes = std::min<size_t>(
-          encodedLengths.size(), lookup.header.recordBytesSize - bucket.recordOffset);
-      status = ReadRowAt(lookup.bucket.shardId, encodedLengths.data(), encodedBytes,
-                         lookup.bucket.blockOffset + recordsOffset + bucket.recordOffset);
-      if (!status) {
-        return status;
-      }
-      size_t lengthCursor = 0;
-      uint32_t keySize = 0;
-      uint32_t valueSize = 0;
-      if (!ReadVarint32(encodedLengths.data(), encodedBytes, lengthCursor, keySize) ||
-          !ReadVarint32(encodedLengths.data(), encodedBytes, lengthCursor, valueSize)) {
-        return Status::Corruption("row record has invalid lengths");
-      }
-      uint64_t keyOffset = 0;
-      uint64_t valueOffset = 0;
-      uint64_t recordEnd = 0;
-      if (!CheckedAdd(bucket.recordOffset, lengthCursor, keyOffset) ||
-          !CheckedAdd(keyOffset, keySize, valueOffset) ||
-          !CheckedAdd(valueOffset, valueSize, recordEnd) ||
-          recordEnd > lookup.header.recordBytesSize) {
-        return Status::Corruption("row record points outside its block");
-      }
-      if (keySize != key.size()) {
-        continue;
-      }
-
-      std::string storedKey(keySize, '\0');
-      status = ReadRowAt(lookup.bucket.shardId, storedKey.data(), storedKey.size(),
-                         lookup.bucket.blockOffset + recordsOffset + keyOffset);
-      if (!status) {
-        return status;
-      }
-      if (storedKey != key) {
-        continue;
-      }
-
-      value.resize(valueSize);
-      return ReadRowAt(lookup.bucket.shardId, value.data(), value.size(),
-                       lookup.bucket.blockOffset + recordsOffset + valueOffset);
     }
     return Status::NotFound("key not found");
   }
@@ -571,6 +779,13 @@ class Database::Impl {
     std::vector<std::byte> buffer;
     uint64_t persistedSize = 0;
     bool used = false;
+    bool spilled = false;
+  };
+
+  struct StageInput {
+    std::string_view key;
+    std::span<const std::byte> value;
+    uint64_t keyHash = 0;
   };
 
   struct EntryView {
@@ -619,62 +834,612 @@ class Database::Impl {
     size_t entryIndex = 0;
   };
 
-  Status StageRecordLocked(uint32_t partitionId, SpillPartition& partition, std::string_view column,
-                           uint64_t columnHash, uint64_t rowId, std::string_view key,
-                           uint64_t keyHash, std::span<const std::byte> value) {
-    detail::StageRecordHeader record;
-    record.columnHash = columnHash;
-    record.keyHash = keyHash;
-    record.rowId = rowId;
-    record.columnSize = static_cast<uint32_t>(column.size());
-    record.keySize = static_cast<uint32_t>(key.size());
-    record.valueSize = static_cast<uint32_t>(value.size());
+  struct KeyEncodingPlan {
+    uint8_t bitsPerSymbol = 8;
+    std::vector<uint8_t> alphabet;
+    std::array<uint8_t, 256> symbolCodes{};
+    std::vector<std::string> prefixes;
+    std::vector<uint8_t> prefixIdsByEntry;
+    uint64_t encodedBytes = 0;
+  };
 
-    uint64_t recordSize = sizeof(record);
-    if (!CheckedAdd(recordSize, column.size(), recordSize) ||
-        !CheckedAdd(recordSize, key.size(), recordSize) ||
-        !CheckedAdd(recordSize, value.size(), recordSize) ||
-        recordSize > std::numeric_limits<size_t>::max()) {
-      return Status::InvalidArgument("staged record is too large");
+  struct KeyMetadataView {
+    detail::RowKeyMetadataHeader header;
+    const uint8_t* alphabet = nullptr;
+    const std::byte* prefixOffsets = nullptr;
+    const char* prefixBytes = nullptr;
+  };
+
+  struct RowRecordView {
+    uint8_t prefixId = 0;
+    uint32_t suffixSize = 0;
+    uint32_t valueSize = 0;
+    const std::byte* encodedSuffix = nullptr;
+    uint32_t encodedSuffixSize = 0;
+    const std::byte* value = nullptr;
+    uint32_t endOffset = 0;
+  };
+
+  uint64_t KeyMetadataSize(const KeyEncodingPlan& plan) const {
+    uint64_t size = sizeof(detail::RowKeyMetadataHeader) + plan.alphabet.size();
+    if (!plan.prefixes.empty()) {
+      size += (plan.prefixes.size() + 1) * sizeof(uint16_t);
+      for (const std::string& prefix : plan.prefixes) {
+        size += prefix.size();
+      }
+    }
+    return size;
+  }
+
+  std::string_view EntrySuffix(const KeyEncodingPlan& plan, size_t entryIndex,
+                               std::string_view key) const {
+    const uint8_t prefixId = plan.prefixIdsByEntry.empty() ? 0 : plan.prefixIdsByEntry[entryIndex];
+    if (prefixId == 0) {
+      return key;
+    }
+    return key.substr(plan.prefixes[prefixId - 1].size());
+  }
+
+  uint64_t MeasureEncoding(const KeyEncodingPlan& plan, std::span<const EntryView> entries,
+                           const std::vector<TemporaryKeySlot>& temporary) const {
+    uint64_t total = KeyMetadataSize(plan);
+    auto add = [&](uint64_t bytes) {
+      if (total > std::numeric_limits<uint64_t>::max() - bytes) {
+        total = std::numeric_limits<uint64_t>::max();
+        return false;
+      }
+      total += bytes;
+      return true;
+    };
+    for (const TemporaryKeySlot& slot : temporary) {
+      if (slot.keyHash == 0) {
+        continue;
+      }
+      const EntryView& entry = entries[slot.entryIndex];
+      const std::string_view suffix = EntrySuffix(plan, slot.entryIndex, entry.key);
+      if (!add(Varint32Size(static_cast<uint32_t>(suffix.size()))) ||
+          !add(Varint32Size(static_cast<uint32_t>(entry.value.size()))) ||
+          !add(plan.prefixes.empty() ? 0 : 1) ||
+          !add(PackedByteCount(static_cast<uint32_t>(suffix.size()), plan.bitsPerSymbol)) ||
+          !add(entry.value.size())) {
+        return total;
+      }
+    }
+    return total;
+  }
+
+  bool AddAlphabet(KeyEncodingPlan& plan, std::span<const EntryView> entries,
+                   const std::vector<TemporaryKeySlot>& temporary) const {
+    std::array<bool, 256> present{};
+    uint32_t symbolCount = 0;
+    for (const TemporaryKeySlot& slot : temporary) {
+      if (slot.keyHash == 0) {
+        continue;
+      }
+      const std::string_view suffix =
+          EntrySuffix(plan, slot.entryIndex, entries[slot.entryIndex].key);
+      for (const unsigned char byte : suffix) {
+        if (!present[byte]) {
+          present[byte] = true;
+          ++symbolCount;
+          if (symbolCount > 64) {
+            return false;
+          }
+        }
+      }
+    }
+    if (symbolCount == 0) {
+      return false;
+    }
+    plan.bitsPerSymbol = symbolCount <= 16 ? 4 : 6;
+    plan.alphabet.reserve(symbolCount);
+    plan.symbolCodes.fill(0xff);
+    for (uint32_t byte = 0; byte < present.size(); ++byte) {
+      if (present[byte]) {
+        plan.symbolCodes[byte] = static_cast<uint8_t>(plan.alphabet.size());
+        plan.alphabet.push_back(static_cast<uint8_t>(byte));
+      }
+    }
+    return true;
+  }
+
+  KeyEncodingPlan ChooseKeyEncoding(std::span<const EntryView> entries,
+                                    const std::vector<TemporaryKeySlot>& temporary) const {
+    KeyEncodingPlan raw;
+    raw.symbolCodes.fill(0xff);
+    raw.encodedBytes = MeasureEncoding(raw, entries, temporary);
+    uint64_t uniqueCount = 0;
+    uint64_t keyBytes = 0;
+    for (const TemporaryKeySlot& slot : temporary) {
+      if (slot.keyHash != 0) {
+        ++uniqueCount;
+        if (!CheckedAdd(keyBytes, entries[slot.entryIndex].key.size(), keyBytes)) {
+          keyBytes = std::numeric_limits<uint64_t>::max();
+        }
+      }
+    }
+    // Short keys are already compact. Keeping them raw avoids paying decode
+    // CPU for only a few bytes of potential savings.
+    if (uniqueCount == 0 || keyBytes < uniqueCount * 16) {
+      return raw;
+    }
+    KeyEncodingPlan best = raw;
+
+    KeyEncodingPlan packed = raw;
+    if (AddAlphabet(packed, entries, temporary)) {
+      packed.encodedBytes = MeasureEncoding(packed, entries, temporary);
+      if (packed.encodedBytes < best.encodedBytes) {
+        best = packed;
+      }
     }
 
-    Status status = EnsureStageFileOpen(partitionId, partition);
-    if (!status) {
-      return status;
+    std::unordered_map<std::string_view, uint32_t> prefixCounts;
+    prefixCounts.reserve(std::min<size_t>(temporary.size() * 2, 128 * 1024));
+    for (const TemporaryKeySlot& slot : temporary) {
+      if (slot.keyHash == 0) {
+        continue;
+      }
+      const std::string_view key = entries[slot.entryIndex].key;
+      for (const uint32_t length : kCandidatePrefixLengths) {
+        if (key.size() > length) {
+          ++prefixCounts[key.substr(0, length)];
+        }
+      }
+    }
+    struct PrefixCandidate {
+      std::string prefix;
+      uint64_t score = 0;
+    };
+    std::vector<PrefixCandidate> candidates;
+    candidates.reserve(prefixCounts.size());
+    for (const auto& [prefix, count] : prefixCounts) {
+      const uint64_t gross = static_cast<uint64_t>(count) * (prefix.size() - 1);
+      const uint64_t metadataCost = prefix.size() + sizeof(uint16_t) * 2;
+      if (count >= 2 && gross > metadataCost) {
+        candidates.push_back(
+            PrefixCandidate{.prefix = std::string(prefix), .score = gross - metadataCost});
+      }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const PrefixCandidate& lhs, const PrefixCandidate& rhs) {
+                if (lhs.score != rhs.score) {
+                  return lhs.score > rhs.score;
+                }
+                if (lhs.prefix.size() != rhs.prefix.size()) {
+                  return lhs.prefix.size() > rhs.prefix.size();
+                }
+                return lhs.prefix < rhs.prefix;
+              });
+    if (candidates.size() > kMaximumPrefixCount) {
+      candidates.resize(kMaximumPrefixCount);
     }
 
-    if (!partition.buffer.empty() &&
-        partition.buffer.size() + recordSize > options_.stageBufferBytes) {
-      status = FlushStageBuffer(partition);
+    if (!candidates.empty()) {
+      std::array<std::unordered_map<std::string_view, uint8_t>, kCandidatePrefixLengths.size()>
+          selectedByLength;
+      KeyEncodingPlan prefixPlan;
+      prefixPlan.symbolCodes.fill(0xff);
+      prefixPlan.prefixIdsByEntry.resize(entries.size(), 0);
+      prefixPlan.prefixes.reserve(candidates.size());
+      for (const PrefixCandidate& candidate : candidates) {
+        prefixPlan.prefixes.push_back(candidate.prefix);
+      }
+      for (size_t candidateIndex = 0; candidateIndex < candidates.size(); ++candidateIndex) {
+        const std::string& prefix = prefixPlan.prefixes[candidateIndex];
+        const uint8_t id = static_cast<uint8_t>(candidateIndex + 1);
+        for (size_t lengthIndex = 0; lengthIndex < kCandidatePrefixLengths.size(); ++lengthIndex) {
+          if (prefix.size() == kCandidatePrefixLengths[lengthIndex]) {
+            selectedByLength[lengthIndex].emplace(prefix, id);
+            break;
+          }
+        }
+      }
+      std::vector<bool> used(prefixPlan.prefixes.size(), false);
+      for (const TemporaryKeySlot& slot : temporary) {
+        if (slot.keyHash == 0) {
+          continue;
+        }
+        const std::string_view key = entries[slot.entryIndex].key;
+        for (size_t lengthIndex = 0; lengthIndex < kCandidatePrefixLengths.size(); ++lengthIndex) {
+          const uint32_t length = kCandidatePrefixLengths[lengthIndex];
+          if (key.size() <= length) {
+            continue;
+          }
+          const auto found = selectedByLength[lengthIndex].find(key.substr(0, length));
+          if (found != selectedByLength[lengthIndex].end()) {
+            prefixPlan.prefixIdsByEntry[slot.entryIndex] = found->second;
+            used[found->second - 1] = true;
+            break;
+          }
+        }
+      }
+
+      std::vector<uint8_t> remap(prefixPlan.prefixes.size() + 1, 0);
+      std::vector<std::string> usedPrefixes;
+      usedPrefixes.reserve(prefixPlan.prefixes.size());
+      for (size_t index = 0; index < prefixPlan.prefixes.size(); ++index) {
+        if (used[index]) {
+          remap[index + 1] = static_cast<uint8_t>(usedPrefixes.size() + 1);
+          usedPrefixes.push_back(std::move(prefixPlan.prefixes[index]));
+        }
+      }
+      for (uint8_t& id : prefixPlan.prefixIdsByEntry) {
+        id = remap[id];
+      }
+      prefixPlan.prefixes = std::move(usedPrefixes);
+      prefixPlan.encodedBytes = MeasureEncoding(prefixPlan, entries, temporary);
+      if (prefixPlan.encodedBytes < best.encodedBytes) {
+        best = prefixPlan;
+      }
+      KeyEncodingPlan prefixPacked = prefixPlan;
+      if (AddAlphabet(prefixPacked, entries, temporary)) {
+        prefixPacked.encodedBytes = MeasureEncoding(prefixPacked, entries, temporary);
+        if (prefixPacked.encodedBytes < best.encodedBytes) {
+          best = std::move(prefixPacked);
+        }
+      }
+    }
+
+    // Encoding must pay for its read-side branch and metadata. Small wins stay
+    // in the raw format; larger wins are selected independently for each row.
+    if (best.encodedBytes > raw.encodedBytes - raw.encodedBytes / 10 ||
+        raw.encodedBytes - best.encodedBytes < uniqueCount * 8) {
+      return raw;
+    }
+    return best;
+  }
+
+  Status SerializeKeyMetadata(const KeyEncodingPlan& plan, std::vector<std::byte>& output) const {
+    uint64_t prefixBytesSize = 0;
+    for (const std::string& prefix : plan.prefixes) {
+      prefixBytesSize += prefix.size();
+    }
+    if (plan.prefixes.size() > kMaximumPrefixCount ||
+        prefixBytesSize > std::numeric_limits<uint16_t>::max()) {
+      return Status::InvalidArgument("row key prefix dictionary is too large");
+    }
+    detail::RowKeyMetadataHeader header;
+    header.bitsPerSymbol = plan.bitsPerSymbol;
+    header.alphabetSize = static_cast<uint8_t>(plan.alphabet.size());
+    header.prefixCount = static_cast<uint16_t>(plan.prefixes.size());
+    header.prefixBytesSize = static_cast<uint32_t>(prefixBytesSize);
+    AppendRaw(output, &header, sizeof(header));
+    AppendRaw(output, plan.alphabet.data(), plan.alphabet.size());
+    if (!plan.prefixes.empty()) {
+      uint16_t offset = 0;
+      AppendRaw(output, &offset, sizeof(offset));
+      for (const std::string& prefix : plan.prefixes) {
+        offset = static_cast<uint16_t>(offset + prefix.size());
+        AppendRaw(output, &offset, sizeof(offset));
+      }
+      for (const std::string& prefix : plan.prefixes) {
+        AppendRaw(output, prefix.data(), prefix.size());
+      }
+    }
+    return Status::Ok();
+  }
+
+  Status ParseKeyMetadata(std::span<const std::byte> metadata, KeyMetadataView& view) const {
+    if (metadata.size() < sizeof(detail::RowKeyMetadataHeader)) {
+      return Status::Corruption("row key metadata is truncated");
+    }
+    std::memcpy(&view.header, metadata.data(), sizeof(view.header));
+    if ((view.header.bitsPerSymbol != 4 && view.header.bitsPerSymbol != 6 &&
+         view.header.bitsPerSymbol != 8) ||
+        view.header.prefixCount > kMaximumPrefixCount ||
+        (view.header.bitsPerSymbol == 8 && view.header.alphabetSize != 0) ||
+        (view.header.bitsPerSymbol == 4 &&
+         (view.header.alphabetSize == 0 || view.header.alphabetSize > 16)) ||
+        (view.header.bitsPerSymbol == 6 &&
+         (view.header.alphabetSize <= 16 || view.header.alphabetSize > 64)) ||
+        (view.header.prefixCount == 0 && view.header.prefixBytesSize != 0)) {
+      return Status::Corruption("row key metadata header is invalid");
+    }
+    uint64_t expected = sizeof(view.header) + view.header.alphabetSize;
+    if (view.header.prefixCount != 0) {
+      expected += static_cast<uint64_t>(view.header.prefixCount + 1) * sizeof(uint16_t);
+    }
+    expected += view.header.prefixBytesSize;
+    if (expected != metadata.size()) {
+      return Status::Corruption("row key metadata size is invalid");
+    }
+    view.alphabet = reinterpret_cast<const uint8_t*>(metadata.data() + sizeof(view.header));
+    const std::byte* cursor = metadata.data() + sizeof(view.header) + view.header.alphabetSize;
+    view.prefixOffsets = view.header.prefixCount == 0 ? nullptr : cursor;
+    if (view.header.prefixCount != 0) {
+      uint16_t previous = 0;
+      for (uint32_t index = 0; index <= view.header.prefixCount; ++index) {
+        uint16_t current = 0;
+        std::memcpy(&current, cursor + index * sizeof(uint16_t), sizeof(current));
+        if ((index == 0 && current != 0) || current < previous ||
+            current > view.header.prefixBytesSize) {
+          return Status::Corruption("row key prefix offsets are invalid");
+        }
+        previous = current;
+      }
+      if (previous != view.header.prefixBytesSize) {
+        return Status::Corruption("row key prefix bytes are incomplete");
+      }
+      cursor += static_cast<size_t>(view.header.prefixCount + 1) * sizeof(uint16_t);
+    }
+    view.prefixBytes = reinterpret_cast<const char*>(cursor);
+    return Status::Ok();
+  }
+
+  std::string_view PrefixAt(const KeyMetadataView& metadata, uint8_t prefixId) const {
+    if (prefixId == 0) {
+      return {};
+    }
+    uint16_t begin = 0;
+    uint16_t end = 0;
+    std::memcpy(&begin, metadata.prefixOffsets + (prefixId - 1) * sizeof(uint16_t), sizeof(begin));
+    std::memcpy(&end, metadata.prefixOffsets + prefixId * sizeof(uint16_t), sizeof(end));
+    return {metadata.prefixBytes + begin, static_cast<size_t>(end - begin)};
+  }
+
+  Status ParseRowRecord(std::span<const std::byte> records, uint32_t recordOffset,
+                        const KeyMetadataView& metadata, RowRecordView& record) const {
+    if (recordOffset >= records.size()) {
+      return Status::Corruption("row bucket points outside its record region");
+    }
+    size_t cursor = recordOffset;
+    if (!ReadVarint32(records.data(), records.size(), cursor, record.suffixSize) ||
+        !ReadVarint32(records.data(), records.size(), cursor, record.valueSize)) {
+      return Status::Corruption("row record has invalid lengths");
+    }
+    if (metadata.header.prefixCount != 0) {
+      if (cursor >= records.size()) {
+        return Status::Corruption("row record has no prefix ID");
+      }
+      record.prefixId = std::to_integer<uint8_t>(records[cursor++]);
+      if (record.prefixId > metadata.header.prefixCount) {
+        return Status::Corruption("row record has an invalid prefix ID");
+      }
+    }
+    record.encodedSuffixSize = PackedByteCount(record.suffixSize, metadata.header.bitsPerSymbol);
+    const uint64_t end =
+        static_cast<uint64_t>(cursor) + record.encodedSuffixSize + record.valueSize;
+    if (end > records.size()) {
+      return Status::Corruption("row record extends beyond its record region");
+    }
+    record.encodedSuffix = records.data() + cursor;
+    record.value = record.encodedSuffix + record.encodedSuffixSize;
+    record.endOffset = static_cast<uint32_t>(end);
+    return Status::Ok();
+  }
+
+  uint8_t PackedSymbolAt(const std::byte* data, uint32_t index, uint8_t bitsPerSymbol) const {
+    const uint64_t bitOffset = static_cast<uint64_t>(index) * bitsPerSymbol;
+    const uint32_t byteOffset = static_cast<uint32_t>(bitOffset / 8);
+    const uint32_t shift = static_cast<uint32_t>(bitOffset % 8);
+    uint16_t word = std::to_integer<uint8_t>(data[byteOffset]);
+    if (shift + bitsPerSymbol > 8) {
+      word |= static_cast<uint16_t>(std::to_integer<uint8_t>(data[byteOffset + 1])) << 8;
+    }
+    return static_cast<uint8_t>((word >> shift) & ((1U << bitsPerSymbol) - 1));
+  }
+
+  Status RecordKeyMatches(const KeyMetadataView& metadata, const RowRecordView& record,
+                          std::string_view key, bool& matches) const {
+    matches = false;
+    const std::string_view prefix = PrefixAt(metadata, record.prefixId);
+    if (key.size() != prefix.size() + record.suffixSize || !key.starts_with(prefix)) {
+      return Status::Ok();
+    }
+    const std::string_view suffix = key.substr(prefix.size());
+    if (metadata.header.bitsPerSymbol == 8) {
+      matches = std::memcmp(suffix.data(), record.encodedSuffix, suffix.size()) == 0;
+      return Status::Ok();
+    }
+    if (metadata.header.bitsPerSymbol == 4) {
+      for (uint64_t index = 0; index < record.suffixSize; index += 2) {
+        const uint8_t packed = std::to_integer<uint8_t>(record.encodedSuffix[index / 2]);
+        const uint8_t first = packed & 0x0f;
+        if (first >= metadata.header.alphabetSize ||
+            static_cast<uint8_t>(suffix[index]) != metadata.alphabet[first]) {
+          return first >= metadata.header.alphabetSize
+                     ? Status::Corruption("row key uses an invalid alphabet symbol")
+                     : Status::Ok();
+        }
+        if (index + 1 < record.suffixSize) {
+          const uint8_t second = packed >> 4;
+          if (second >= metadata.header.alphabetSize ||
+              static_cast<uint8_t>(suffix[index + 1]) != metadata.alphabet[second]) {
+            return second >= metadata.header.alphabetSize
+                       ? Status::Corruption("row key uses an invalid alphabet symbol")
+                       : Status::Ok();
+          }
+        }
+      }
+    } else {
+      for (uint64_t index = 0; index < record.suffixSize; index += 4) {
+        const uint64_t byteIndex = (index / 4) * 3;
+        uint32_t packed = std::to_integer<uint8_t>(record.encodedSuffix[byteIndex]);
+        if (byteIndex + 1 < record.encodedSuffixSize) {
+          packed |=
+              static_cast<uint32_t>(std::to_integer<uint8_t>(record.encodedSuffix[byteIndex + 1]))
+              << 8;
+        }
+        if (byteIndex + 2 < record.encodedSuffixSize) {
+          packed |=
+              static_cast<uint32_t>(std::to_integer<uint8_t>(record.encodedSuffix[byteIndex + 2]))
+              << 16;
+        }
+        const uint32_t count =
+            static_cast<uint32_t>(std::min<uint64_t>(4, record.suffixSize - index));
+        for (uint32_t lane = 0; lane < count; ++lane) {
+          const uint8_t code = static_cast<uint8_t>((packed >> (lane * 6)) & 0x3f);
+          if (code >= metadata.header.alphabetSize ||
+              static_cast<uint8_t>(suffix[index + lane]) != metadata.alphabet[code]) {
+            return code >= metadata.header.alphabetSize
+                       ? Status::Corruption("row key uses an invalid alphabet symbol")
+                       : Status::Ok();
+          }
+        }
+      }
+    }
+    matches = true;
+    return Status::Ok();
+  }
+
+  Status DecodeRecordKey(const KeyMetadataView& metadata, const RowRecordView& record,
+                         std::string& key) const {
+    const std::string_view prefix = PrefixAt(metadata, record.prefixId);
+    key.assign(prefix);
+    const size_t prefixSize = key.size();
+    key.resize(prefixSize + record.suffixSize);
+    if (metadata.header.bitsPerSymbol == 8) {
+      std::memcpy(key.data() + prefixSize, record.encodedSuffix, record.suffixSize);
+      return Status::Ok();
+    }
+    for (uint32_t index = 0; index < record.suffixSize; ++index) {
+      const uint8_t code =
+          PackedSymbolAt(record.encodedSuffix, index, metadata.header.bitsPerSymbol);
+      if (code >= metadata.header.alphabetSize) {
+        return Status::Corruption("row key uses an invalid alphabet symbol");
+      }
+      key[prefixSize + index] = static_cast<char>(metadata.alphabet[code]);
+    }
+    return Status::Ok();
+  }
+
+  void WriteEncodedSuffix(std::byte* output, std::string_view suffix,
+                          const KeyEncodingPlan& plan) const {
+    const uint32_t outputSize =
+        PackedByteCount(static_cast<uint32_t>(suffix.size()), plan.bitsPerSymbol);
+    std::memset(output, 0, outputSize);
+    if (plan.bitsPerSymbol == 8) {
+      std::memcpy(output, suffix.data(), suffix.size());
+      return;
+    }
+    if (plan.bitsPerSymbol == 4) {
+      for (size_t index = 0; index < suffix.size(); index += 2) {
+        uint8_t packed = plan.symbolCodes[static_cast<uint8_t>(suffix[index])];
+        if (index + 1 < suffix.size()) {
+          packed |=
+              static_cast<uint8_t>(plan.symbolCodes[static_cast<uint8_t>(suffix[index + 1])] << 4);
+        }
+        output[index / 2] = static_cast<std::byte>(packed);
+      }
+    } else {
+      for (size_t index = 0; index < suffix.size(); index += 4) {
+        const uint32_t count = static_cast<uint32_t>(std::min<size_t>(4, suffix.size() - index));
+        uint32_t packed = 0;
+        for (uint32_t lane = 0; lane < count; ++lane) {
+          packed |=
+              static_cast<uint32_t>(plan.symbolCodes[static_cast<uint8_t>(suffix[index + lane])])
+              << (lane * 6);
+        }
+        const size_t byteIndex = (index / 4) * 3;
+        output[byteIndex] = static_cast<std::byte>(packed & 0xff);
+        if (byteIndex + 1 < outputSize) {
+          output[byteIndex + 1] = static_cast<std::byte>((packed >> 8) & 0xff);
+        }
+        if (byteIndex + 2 < outputSize) {
+          output[byteIndex + 2] = static_cast<std::byte>((packed >> 16) & 0xff);
+        }
+      }
+    }
+  }
+
+  Status StageChunkLocked(uint32_t partitionId, SpillPartition& partition, std::string_view column,
+                          uint64_t columnHash, uint64_t rowId,
+                          std::span<const StageInput> entries) {
+    if (entries.empty()) {
+      return Status::Ok();
+    }
+    uint64_t chunkSize = sizeof(detail::StageChunkHeader) + column.size();
+    for (const StageInput& entry : entries) {
+      uint64_t recordSize = sizeof(uint64_t) +
+                            Varint32Size(static_cast<uint32_t>(entry.key.size())) +
+                            Varint32Size(static_cast<uint32_t>(entry.value.size()));
+      if (!CheckedAdd(recordSize, entry.key.size(), recordSize) ||
+          !CheckedAdd(recordSize, entry.value.size(), recordSize) ||
+          !CheckedAdd(chunkSize, recordSize, chunkSize)) {
+        return Status::InvalidArgument("staged chunk is too large");
+      }
+    }
+    if (chunkSize > std::numeric_limits<uint32_t>::max() && entries.size() > 1) {
+      const size_t midpoint = entries.size() / 2;
+      Status status = StageChunkLocked(partitionId, partition, column, columnHash, rowId,
+                                       entries.first(midpoint));
       if (!status) {
         return status;
       }
+      return StageChunkLocked(partitionId, partition, column, columnHash, rowId,
+                              entries.subspan(midpoint));
+    }
+    if (chunkSize > std::numeric_limits<uint32_t>::max() ||
+        chunkSize > std::numeric_limits<size_t>::max() ||
+        entries.size() > std::numeric_limits<uint32_t>::max()) {
+      return Status::InvalidArgument("staged chunk must be smaller than 4 GiB");
     }
 
-    if (recordSize > options_.stageBufferBytes) {
-      std::vector<std::byte> packed;
-      packed.reserve(static_cast<size_t>(recordSize));
-      AppendRaw(packed, &record, sizeof(record));
-      AppendRaw(packed, column.data(), column.size());
-      AppendRaw(packed, key.data(), key.size());
-      AppendRaw(packed, value.data(), value.size());
-      status = detail::WriteAllAt(partition.file.Get(), packed.data(), packed.size(),
-                                  partition.persistedSize);
-      if (status) {
-        partition.persistedSize += packed.size();
-      }
+    std::vector<std::byte> packed;
+    packed.reserve(static_cast<size_t>(chunkSize));
+    detail::StageChunkHeader header;
+    header.chunkSize = static_cast<uint32_t>(chunkSize);
+    header.recordCount = static_cast<uint32_t>(entries.size());
+    header.columnHash = columnHash;
+    header.rowId = rowId;
+    header.columnSize = static_cast<uint32_t>(column.size());
+    AppendRaw(packed, &header, sizeof(header));
+    AppendRaw(packed, column.data(), column.size());
+    for (const StageInput& entry : entries) {
+      AppendRaw(packed, &entry.keyHash, sizeof(entry.keyHash));
+      const size_t lengthsOffset = packed.size();
+      packed.resize(lengthsOffset + Varint32Size(static_cast<uint32_t>(entry.key.size())) +
+                    Varint32Size(static_cast<uint32_t>(entry.value.size())));
+      size_t lengthCursor = lengthsOffset;
+      lengthCursor +=
+          WriteVarint32(packed.data() + lengthCursor, static_cast<uint32_t>(entry.key.size()));
+      WriteVarint32(packed.data() + lengthCursor, static_cast<uint32_t>(entry.value.size()));
+      AppendRaw(packed, entry.key.data(), entry.key.size());
+      AppendRaw(packed, entry.value.data(), entry.value.size());
+    }
+    if (packed.size() != chunkSize) {
+      return Status::Corruption("staged chunk size mismatch");
+    }
+
+    partition.used = true;
+    if (!partition.spilled && partition.buffer.size() <= stageMemoryLimitPerPartition_ &&
+        packed.size() <= stageMemoryLimitPerPartition_ - partition.buffer.size()) {
+      AppendRaw(partition.buffer, packed.data(), packed.size());
     } else {
-      partition.buffer.reserve(options_.stageBufferBytes);
-      AppendRaw(partition.buffer, &record, sizeof(record));
-      AppendRaw(partition.buffer, column.data(), column.size());
-      AppendRaw(partition.buffer, key.data(), key.size());
-      AppendRaw(partition.buffer, value.data(), value.size());
-    }
-    if (!status) {
-      return status;
+      Status status = Status::Ok();
+      if (!partition.spilled) {
+        status = EnsureStageFileOpen(partitionId, partition);
+        if (!status) {
+          return status;
+        }
+        partition.spilled = true;
+        status = FlushStageBuffer(partition);
+        if (!status) {
+          return status;
+        }
+      }
+      const uint64_t ioBufferLimit =
+          std::min<uint64_t>(options_.stageBufferBytes, stageMemoryLimitPerPartition_);
+      if (!partition.buffer.empty() && partition.buffer.size() + packed.size() > ioBufferLimit) {
+        status = FlushStageBuffer(partition);
+        if (!status) {
+          return status;
+        }
+      }
+      if (packed.size() > ioBufferLimit) {
+        status = detail::WriteAllAt(partition.file.Get(), packed.data(), packed.size(),
+                                    partition.persistedSize);
+        if (!status) {
+          return status;
+        }
+        partition.persistedSize += packed.size();
+      } else {
+        partition.buffer.reserve(static_cast<size_t>(ioBufferLimit));
+        AppendRaw(partition.buffer, packed.data(), packed.size());
+      }
     }
 
-    stagedEntryCount_.fetch_add(1, std::memory_order_relaxed);
+    stagedEntryCount_.fetch_add(entries.size(), std::memory_order_relaxed);
     return Status::Ok();
   }
 
@@ -736,6 +1501,8 @@ class Database::Impl {
       for (uint32_t index = 0; index < spillPartitionCount_; ++index) {
         spillPartitions_.push_back(std::make_unique<SpillPartition>());
       }
+      stageMemoryLimitPerPartition_ = std::max<uint64_t>(
+          1, options_.memoryBudgetBytes / 2 / std::max<size_t>(1, spillPartitions_.size()));
     }
     nextSequence_.store(IndexHeader()->nextSequence, std::memory_order_release);
     open_ = true;
@@ -797,7 +1564,9 @@ class Database::Impl {
 
     uint32_t spillCount = options_.spillPartitionCount;
     if (spillCount == 0) {
-      uint64_t bytesPerEntry = sizeof(detail::StageRecordHeader) + 16;
+      // Compact stage records retain the key hash plus two small varints. The
+      // chunk/column header is amortized over a batch.
+      uint64_t bytesPerEntry = sizeof(uint64_t) + 4;
       if (!CheckedAdd(bytesPerEntry, options_.averageKeyBytes, bytesPerEntry) ||
           !CheckedAdd(bytesPerEntry, options_.averageValueBytes, bytesPerEntry)) {
         bytesPerEntry = std::numeric_limits<uint64_t>::max();
@@ -859,8 +1628,8 @@ class Database::Impl {
 
   uint32_t ChooseTargetEntries() const {
     uint32_t best = 0;
-    for (uint64_t bucketCount = 2; bucketCount <= (1ULL << 31) && best < options_.maxEntriesPerRow;
-         bucketCount <<= 1) {
+    for (uint64_t bucketCount = kControlGroupWidth;
+         bucketCount <= (1ULL << 31) && best < options_.maxEntriesPerRow; bucketCount <<= 1) {
       const uint64_t candidate = std::min<uint64_t>(
           options_.maxEntriesPerRow, static_cast<uint64_t>(bucketCount * kRowLoadFactor));
       uint64_t estimated = sizeof(detail::RowBlockHeader) + 32;
@@ -869,7 +1638,9 @@ class Database::Impl {
       const uint64_t payloadBytesPerEntry =
           static_cast<uint64_t>(options_.averageKeyBytes) + options_.averageValueBytes +
           Varint32Size(options_.averageKeyBytes) + Varint32Size(options_.averageValueBytes);
-      if (!CheckedMultiply(bucketCount, sizeof(detail::RowKeyBucket), bucketBytes) ||
+      // One control byte plus a conservative 32-bit record offset. Rows below
+      // 16 MiB actually use a 24-bit offset.
+      if (!CheckedMultiply(bucketCount, 5, bucketBytes) ||
           !CheckedMultiply(candidate, payloadBytesPerEntry, payloadBytes) ||
           !CheckedAdd(estimated, bucketBytes, estimated) ||
           !CheckedAdd(estimated, payloadBytes, estimated)) {
@@ -1169,18 +1940,27 @@ class Database::Impl {
     const uint64_t entryTotal = stagedEntryCount_.load(std::memory_order_acquire);
     ReportProgress(WritePhase::kStaging, 0, entryTotal);
     uint64_t maximumPartitionBytes = 0;
+    uint64_t residentStageBytes = 0;
     uint32_t usedPartitions = 0;
     for (auto& partitionPtr : spillPartitions_) {
       SpillPartition& partition = *partitionPtr;
       if (!partition.used) {
         continue;
       }
-      Status status = FlushStageBuffer(partition);
-      if (!status) {
-        writePoisoned_.store(true, std::memory_order_release);
-        return status;
+      if (partition.spilled) {
+        Status status = FlushStageBuffer(partition);
+        if (!status) {
+          writePoisoned_.store(true, std::memory_order_release);
+          return status;
+        }
       }
-      maximumPartitionBytes = std::max(maximumPartitionBytes, partition.persistedSize);
+      const uint64_t partitionBytes =
+          partition.spilled ? partition.persistedSize - sizeof(detail::StageFileHeader)
+                            : partition.buffer.size();
+      maximumPartitionBytes = std::max(maximumPartitionBytes, partitionBytes);
+      if (!partition.spilled) {
+        residentStageBytes += partitionBytes;
+      }
       ++usedPartitions;
     }
     ReportProgress(WritePhase::kStaging, entryTotal, entryTotal);
@@ -1192,8 +1972,11 @@ class Database::Impl {
           maximumPartitionBytes > std::numeric_limits<uint64_t>::max() / 3
               ? std::numeric_limits<uint64_t>::max()
               : maximumPartitionBytes * 3;
+      const uint64_t availableWorkerMemory = options_.memoryBudgetBytes > residentStageBytes
+                                                 ? options_.memoryBudgetBytes - residentStageBytes
+                                                 : 1;
       const uint64_t memoryWorkers = std::max<uint64_t>(
-          1, options_.memoryBudgetBytes / std::max<uint64_t>(1, estimatedWorkerMemory));
+          1, availableWorkerMemory / std::max<uint64_t>(1, estimatedWorkerMemory));
       workerCount = static_cast<uint32_t>(std::min<uint64_t>(workerCount, memoryWorkers));
     }
 
@@ -1292,21 +2075,34 @@ class Database::Impl {
 
   Status ProcessStagePartition(uint32_t partitionId) {
     SpillPartition& partition = *spillPartitions_[partitionId];
-    if (partition.persistedSize < sizeof(detail::StageFileHeader)) {
-      return Status::Corruption("stage file is truncated");
-    }
     detail::MappedFile map;
-    Status status = map.MapReadOnly(partition.file.Get(), partition.persistedSize);
-    if (!status) {
-      return status;
+    const std::byte* bytes = nullptr;
+    uint64_t byteCount = 0;
+    if (partition.spilled) {
+      if (partition.persistedSize < sizeof(detail::StageFileHeader)) {
+        return Status::Corruption("stage file is truncated");
+      }
+      Status status = map.MapReadOnly(partition.file.Get(), partition.persistedSize);
+      if (!status) {
+        return status;
+      }
+      bytes = static_cast<const std::byte*>(map.Data());
+      detail::StageFileHeader fileHeader;
+      std::memcpy(&fileHeader, bytes, sizeof(fileHeader));
+      if (!MagicEquals(fileHeader.magic, detail::kStageFileMagic) ||
+          fileHeader.version != detail::kStorageVersion ||
+          fileHeader.headerSize != sizeof(fileHeader) || fileHeader.partitionId != partitionId ||
+          fileHeader.partitionCount != spillPartitions_.size()) {
+        return Status::Corruption("stage file header is invalid");
+      }
+      bytes += sizeof(fileHeader);
+      byteCount = partition.persistedSize - sizeof(fileHeader);
+    } else {
+      bytes = partition.buffer.data();
+      byteCount = partition.buffer.size();
     }
-    const auto* bytes = static_cast<const std::byte*>(map.Data());
-    detail::StageFileHeader fileHeader;
-    std::memcpy(&fileHeader, bytes, sizeof(fileHeader));
-    if (!MagicEquals(fileHeader.magic, detail::kStageFileMagic) ||
-        fileHeader.partitionId != partitionId ||
-        fileHeader.partitionCount != spillPartitions_.size()) {
-      return Status::Corruption("stage file header is invalid");
+    if (byteCount == 0) {
+      return Status::Corruption("used stage partition is empty");
     }
 
     std::unordered_map<StageGroupKey, size_t, StageGroupKeyHash> groupIndexes;
@@ -1319,9 +2115,7 @@ class Database::Impl {
         CheckedMultiply(DivideRoundUp(routeCount_, spillPartitions_.size()),
                         expectedAutomaticColumnCount_, approximateAutomaticGroups) &&
         CheckedAdd(approximateAutomaticGroups, explicitGroups, approximateGroups);
-    const uint64_t maximumGroupsInFile =
-        (partition.persistedSize - sizeof(detail::StageFileHeader)) /
-        sizeof(detail::StageRecordHeader);
+    const uint64_t maximumGroupsInFile = byteCount / sizeof(detail::StageChunkHeader);
     if (groupEstimateValid) {
       approximateGroups = std::min(approximateGroups, maximumGroupsInFile);
     }
@@ -1330,54 +2124,67 @@ class Database::Impl {
       groups.reserve(static_cast<size_t>(approximateGroups));
     }
 
-    uint64_t offset = sizeof(detail::StageFileHeader);
-    while (offset < partition.persistedSize) {
-      if (sizeof(detail::StageRecordHeader) > partition.persistedSize - offset) {
-        return Status::Corruption("stage file has a partial record header");
+    uint64_t offset = 0;
+    while (offset < byteCount) {
+      if (sizeof(detail::StageChunkHeader) > byteCount - offset) {
+        return Status::Corruption("stage file has a partial chunk header");
       }
-      detail::StageRecordHeader record;
-      std::memcpy(&record, bytes + offset, sizeof(record));
-      if (record.magic != detail::kStageRecordMagic || record.version != detail::kStorageVersion ||
-          record.headerSize != sizeof(record) || record.columnHash == 0 || record.keyHash == 0) {
-        return Status::Corruption("stage record header is invalid");
+      detail::StageChunkHeader chunk;
+      std::memcpy(&chunk, bytes + offset, sizeof(chunk));
+      if (chunk.magic != detail::kStageChunkMagic || chunk.version != detail::kStorageVersion ||
+          chunk.headerSize != sizeof(chunk) || chunk.columnHash == 0 || chunk.recordCount == 0 ||
+          chunk.columnSize == 0 || chunk.chunkSize < sizeof(chunk) + chunk.columnSize ||
+          chunk.chunkSize > byteCount - offset) {
+        return Status::Corruption("stage chunk header is invalid");
       }
-      uint64_t recordSize = sizeof(record);
-      if (!CheckedAdd(recordSize, record.columnSize, recordSize) ||
-          !CheckedAdd(recordSize, record.keySize, recordSize) ||
-          !CheckedAdd(recordSize, record.valueSize, recordSize) ||
-          recordSize > partition.persistedSize - offset) {
-        return Status::Corruption("stage record extends beyond its file");
-      }
-      if (detail::MixHashes(record.columnHash, record.rowId) % spillPartitions_.size() !=
+      if (detail::MixHashes(chunk.columnHash, chunk.rowId) % spillPartitions_.size() !=
           partitionId) {
-        return Status::Corruption("stage record is in the wrong partition");
+        return Status::Corruption("stage chunk is in the wrong partition");
       }
 
-      const char* columnData = reinterpret_cast<const char*>(bytes + offset + sizeof(record));
-      const char* keyData = columnData + record.columnSize;
-      const std::byte* valueData = reinterpret_cast<const std::byte*>(keyData + record.keySize);
-      const std::string_view column(columnData, record.columnSize);
-      const std::string_view key(keyData, record.keySize);
-      const uint64_t rowId = record.rowId;
-      const StageGroupKey groupKey{record.columnHash, rowId, column};
+      const std::byte* chunkBytes = bytes + offset;
+      const char* columnData = reinterpret_cast<const char*>(chunkBytes + sizeof(chunk));
+      const std::string_view column(columnData, chunk.columnSize);
+      const StageGroupKey groupKey{chunk.columnHash, chunk.rowId, column};
       auto [iterator, inserted] = groupIndexes.emplace(groupKey, groups.size());
       if (inserted) {
         groups.push_back(
-            StageGroup{.column = column, .columnHash = record.columnHash, .rowId = rowId});
+            StageGroup{.column = column, .columnHash = chunk.columnHash, .rowId = chunk.rowId});
       }
       StageGroup& group = groups[iterator->second];
-      group.entries.push_back(
-          EntryView{.key = key,
-                    .value = std::span<const std::byte>(valueData, record.valueSize),
-                    .keyHash = record.keyHash});
-      offset += recordSize;
+      size_t cursor = sizeof(chunk) + chunk.columnSize;
+      for (uint32_t recordIndex = 0; recordIndex < chunk.recordCount; ++recordIndex) {
+        if (sizeof(uint64_t) > chunk.chunkSize - cursor) {
+          return Status::Corruption("stage chunk has a partial key hash");
+        }
+        uint64_t keyHash = 0;
+        std::memcpy(&keyHash, chunkBytes + cursor, sizeof(keyHash));
+        cursor += sizeof(keyHash);
+        uint32_t keySize = 0;
+        uint32_t valueSize = 0;
+        if (keyHash == 0 || !ReadVarint32(chunkBytes, chunk.chunkSize, cursor, keySize) ||
+            !ReadVarint32(chunkBytes, chunk.chunkSize, cursor, valueSize) || keySize == 0 ||
+            keySize > chunk.chunkSize - cursor || valueSize > chunk.chunkSize - cursor - keySize) {
+          return Status::Corruption("stage chunk record is invalid");
+        }
+        const char* keyData = reinterpret_cast<const char*>(chunkBytes + cursor);
+        const std::byte* valueData = chunkBytes + cursor + keySize;
+        group.entries.push_back(EntryView{.key = std::string_view(keyData, keySize),
+                                          .value = std::span<const std::byte>(valueData, valueSize),
+                                          .keyHash = keyHash});
+        cursor += static_cast<size_t>(keySize) + valueSize;
+      }
+      if (cursor != chunk.chunkSize) {
+        return Status::Corruption("stage chunk has trailing bytes");
+      }
+      offset += chunk.chunkSize;
     }
-    if (offset != partition.persistedSize) {
+    if (offset != byteCount) {
       return Status::Corruption("stage file has trailing bytes");
     }
 
     for (const StageGroup& group : groups) {
-      status = WriteStageGroup(group);
+      Status status = WriteStageGroup(group);
       if (!status) {
         return status;
       }
@@ -1459,44 +2266,49 @@ class Database::Impl {
     if (!status) {
       return status;
     }
-    const uint64_t bucketOffset = AlignUp8(sizeof(header) + header.columnSize);
-    const uint64_t recordsOffset =
-        bucketOffset + static_cast<uint64_t>(header.bucketCount) * sizeof(detail::RowKeyBucket);
-    const std::byte* records = block.data() + recordsOffset;
+    const uint64_t metadataOffset = AlignUp8(sizeof(header) + header.columnSize);
+    const uint64_t localIndexOffset = AlignUp64(metadataOffset + header.keyMetadataBytesSize);
+    const uint64_t offsetsOffset = localIndexOffset + header.bucketCount;
+    const uint64_t recordsOffset = localIndexOffset + static_cast<uint64_t>(header.bucketCount) *
+                                                          (header.recordOffsetWidth + 1);
+    KeyMetadataView metadata;
+    status = ParseKeyMetadata(
+        std::span<const std::byte>(block.data() + metadataOffset, header.keyMetadataBytesSize),
+        metadata);
+    if (!status) {
+      return status;
+    }
+    const std::span<const std::byte> records(block.data() + recordsOffset, header.recordBytesSize);
     entries.reserve(header.itemCount);
     for (uint32_t index = 0; index < header.bucketCount; ++index) {
-      detail::RowKeyBucket bucket;
-      std::memcpy(&bucket,
-                  block.data() + bucketOffset + static_cast<uint64_t>(index) * sizeof(bucket),
-                  sizeof(bucket));
-      if (bucket.keyFingerprint == 0) {
+      const bool interleaved = header.recordOffsetWidth == 3;
+      const uint64_t bucketOffset = localIndexOffset + static_cast<uint64_t>(index) * 4;
+      const uint8_t control =
+          std::to_integer<uint8_t>(block[interleaved ? bucketOffset : localIndexOffset + index]);
+      if (control == 0) {
         continue;
       }
-      if (bucket.recordOffset >= header.recordBytesSize) {
-        return Status::Corruption("row bucket points outside its block");
-      }
-      size_t cursor = bucket.recordOffset;
-      uint32_t keySize = 0;
-      uint32_t valueSize = 0;
-      if (!ReadVarint32(records, header.recordBytesSize, cursor, keySize) ||
-          !ReadVarint32(records, header.recordBytesSize, cursor, valueSize) ||
-          keySize > header.recordBytesSize - cursor) {
-        return Status::Corruption("row record has invalid lengths");
-      }
-      const size_t keyOffset = cursor;
-      cursor += keySize;
-      if (valueSize > header.recordBytesSize - cursor) {
-        return Status::Corruption("row record points outside its block");
+      const std::byte* encodedOffset =
+          interleaved ? block.data() + bucketOffset + 1
+                      : block.data() + offsetsOffset +
+                            static_cast<uint64_t>(index) * header.recordOffsetWidth;
+      const uint32_t recordOffset = ReadRecordOffset(encodedOffset, header.recordOffsetWidth);
+      RowRecordView record;
+      status = ParseRowRecord(records, recordOffset, metadata, record);
+      if (!status) {
+        return status;
       }
       OwnedEntry entry;
-      entry.key.assign(reinterpret_cast<const char*>(records + keyOffset), keySize);
-      if (KeyFingerprint(NormalizeHash(detail::HashString(entry.key))) !=
-          bucket.keyFingerprint) {
+      status = DecodeRecordKey(metadata, record, entry.key);
+      if (!status) {
+        return status;
+      }
+      if (KeyFingerprint(NormalizeHash(detail::HashString(entry.key))) != control) {
         return Status::Corruption("row bucket fingerprint does not match its key");
       }
-      entry.value.resize(valueSize);
-      if (valueSize != 0) {
-        std::memcpy(entry.value.data(), records + cursor, valueSize);
+      entry.value.resize(record.valueSize);
+      if (record.valueSize != 0) {
+        std::memcpy(entry.value.data(), record.value, record.valueSize);
       }
       entries.push_back(std::move(entry));
     }
@@ -1516,15 +2328,19 @@ class Database::Impl {
     // Grow according to the number of unique keys, not the number of staged
     // records. Duplicate writes only replace an entry index and therefore do
     // not inflate either the temporary table or the persisted row table.
-    auto bucketCountForEntries = [](uint64_t entryCount) {
+    auto dedupBucketCountForEntries = [](uint64_t entryCount) {
+      const uint64_t requiredBuckets =
+          static_cast<uint64_t>(static_cast<long double>(entryCount) / 0.75) + 1;
+      return RoundUpPowerOfTwo(requiredBuckets, kControlGroupWidth);
+    };
+    auto finalBucketCountForEntries = [](uint64_t entryCount) {
       const uint64_t requiredBuckets =
           static_cast<uint64_t>(static_cast<long double>(entryCount) / kRowLoadFactor) + 1;
-      return RoundUpPowerOfTwo(requiredBuckets, 2);
+      return RoundUpPowerOfTwo(requiredBuckets, kControlGroupWidth);
     };
-    const uint64_t initialEntryEstimate =
-        std::min<uint64_t>({entries.size(), kMaximumDedupPresizeEntries,
-                            RoutingTargetEntries(targetEntriesPerRow_)});
-    const uint64_t initialBucketCount = bucketCountForEntries(initialEntryEstimate);
+    const uint64_t initialEntryEstimate = std::min<uint64_t>(
+        {entries.size(), kMaximumDedupPresizeEntries, RoutingTargetEntries(targetEntriesPerRow_)});
+    const uint64_t initialBucketCount = dedupBucketCountForEntries(initialEntryEstimate);
     if (initialBucketCount == 0 || initialBucketCount > std::numeric_limits<uint32_t>::max()) {
       return Status::InvalidArgument("row local index is too large");
     }
@@ -1606,53 +2422,39 @@ class Database::Impl {
       }
     }
 
-    const uint64_t bucketCount64 = bucketCountForEntries(uniqueCount);
-    Status status = rehashTemporaryTable(bucketCount64);
-    if (!status) {
-      return status;
-    }
-    uint64_t minimumBlockSize = AlignUp8(sizeof(detail::RowBlockHeader) + column.size());
-    uint64_t minimumBucketBytes = 0;
-    if (!CheckedMultiply(bucketCount64, sizeof(detail::RowKeyBucket), minimumBucketBytes) ||
-        !CheckedAdd(minimumBlockSize, minimumBucketBytes, minimumBlockSize) ||
-        minimumBlockSize > std::numeric_limits<uint32_t>::max()) {
-      return Status::InvalidArgument(
-          "one routed row exceeds the 4 GiB compact-row limit; increase "
-          "expectedEntryCountPerColumn");
+    const uint64_t bucketCount64 = finalBucketCountForEntries(uniqueCount);
+    if (bucketCount64 == 0 || bucketCount64 > std::numeric_limits<uint32_t>::max()) {
+      return Status::InvalidArgument("row local index is too large");
     }
     const uint32_t bucketCount = static_cast<uint32_t>(bucketCount64);
 
-    uint64_t recordBytesSize = 0;
-    for (const TemporaryKeySlot& slot : temporary) {
-      if (slot.keyHash == 0) {
-        continue;
-      }
-      const EntryView& entry = entries[slot.entryIndex];
-      if (entry.key.size() > std::numeric_limits<uint32_t>::max() ||
-          entry.value.size() > std::numeric_limits<uint32_t>::max()) {
-        return Status::InvalidArgument("row key and value must each be smaller than 4 GiB");
-      }
-      uint64_t recordSize = Varint32Size(static_cast<uint32_t>(entry.key.size())) +
-                            Varint32Size(static_cast<uint32_t>(entry.value.size()));
-      if (!CheckedAdd(recordSize, entry.key.size(), recordSize) ||
-          !CheckedAdd(recordSize, entry.value.size(), recordSize) ||
-          !CheckedAdd(recordBytesSize, recordSize, recordBytesSize)) {
-        return Status::InvalidArgument("row payload size overflows uint64");
-      }
+    const KeyEncodingPlan encoding = ChooseKeyEncoding(entries, temporary);
+    std::vector<std::byte> keyMetadata;
+    Status status = SerializeKeyMetadata(encoding, keyMetadata);
+    if (!status) {
+      return status;
     }
+    if (encoding.encodedBytes < keyMetadata.size()) {
+      return Status::Corruption("row key encoding size is inconsistent");
+    }
+    const uint64_t recordBytesSize = encoding.encodedBytes - keyMetadata.size();
     if (recordBytesSize > std::numeric_limits<uint32_t>::max() ||
-        column.size() > std::numeric_limits<uint32_t>::max()) {
+        column.size() > std::numeric_limits<uint32_t>::max() ||
+        keyMetadata.size() > std::numeric_limits<uint32_t>::max()) {
       return Status::InvalidArgument(
           "one routed row exceeds the 4 GiB compact-row limit; increase "
           "expectedEntryCountPerColumn or reduce target row size");
     }
-
-    const uint64_t bucketOffset = AlignUp8(sizeof(detail::RowBlockHeader) + column.size());
-    uint64_t bucketBytes = 0;
+    const uint8_t recordOffsetWidth = recordBytesSize <= 0x00ffffff ? 3 : 4;
+    const uint64_t metadataOffset = AlignUp8(sizeof(detail::RowBlockHeader) + column.size());
+    const uint64_t localIndexOffset = AlignUp64(metadataOffset + keyMetadata.size());
+    uint64_t offsetsOffset = 0;
     uint64_t recordsOffset = 0;
     uint64_t blockSize = 0;
-    if (!CheckedMultiply(bucketCount, sizeof(detail::RowKeyBucket), bucketBytes) ||
-        !CheckedAdd(bucketOffset, bucketBytes, recordsOffset) ||
+    uint64_t localIndexBytes = 0;
+    if (!CheckedAdd(localIndexOffset, bucketCount, offsetsOffset) ||
+        !CheckedMultiply(bucketCount, recordOffsetWidth + 1, localIndexBytes) ||
+        !CheckedAdd(localIndexOffset, localIndexBytes, recordsOffset) ||
         !CheckedAdd(recordsOffset, recordBytesSize, blockSize) ||
         blockSize > std::numeric_limits<uint32_t>::max() ||
         blockSize > std::numeric_limits<size_t>::max()) {
@@ -1667,34 +2469,69 @@ class Database::Impl {
     header.columnSize = static_cast<uint32_t>(column.size());
     header.itemCount = uniqueCount;
     header.bucketCount = bucketCount;
+    header.keyMetadataBytesSize = static_cast<uint32_t>(keyMetadata.size());
     header.recordBytesSize = static_cast<uint32_t>(recordBytesSize);
     header.blockSize = static_cast<uint32_t>(blockSize);
+    header.recordOffsetWidth = recordOffsetWidth;
     std::memcpy(block.data(), &header, sizeof(header));
     std::memcpy(block.data() + sizeof(header), column.data(), column.size());
+    std::memcpy(block.data() + metadataOffset, keyMetadata.data(), keyMetadata.size());
 
     uint32_t recordCursor = 0;
-    for (uint32_t bucketIndex = 0; bucketIndex < bucketCount; ++bucketIndex) {
-      const TemporaryKeySlot& temporarySlot = temporary[bucketIndex];
+    const uint32_t groupCount = bucketCount / kControlGroupWidth;
+    const bool interleaved = recordOffsetWidth == 3;
+    for (const TemporaryKeySlot& temporarySlot : temporary) {
       if (temporarySlot.keyHash == 0) {
         continue;
       }
       const EntryView& entry = entries[temporarySlot.entryIndex];
-      detail::RowKeyBucket bucket;
-      bucket.keyFingerprint = KeyFingerprint(temporarySlot.keyHash);
-      bucket.recordOffset = recordCursor;
-      std::memcpy(block.data() + bucketOffset + static_cast<uint64_t>(bucketIndex) * sizeof(bucket),
-                  &bucket, sizeof(bucket));
+      const uint8_t fingerprint = KeyFingerprint(temporarySlot.keyHash);
+      const uint32_t startGroup = static_cast<uint32_t>(temporarySlot.keyHash) & (groupCount - 1);
+      uint32_t bucketIndex = bucketCount;
+      for (uint32_t groupProbe = 0; groupProbe < groupCount; ++groupProbe) {
+        const uint32_t groupIndex = (startGroup + groupProbe) & (groupCount - 1);
+        const uint32_t groupBase = groupIndex * kControlGroupWidth;
+        std::byte* groupData = block.data() + localIndexOffset +
+                               static_cast<uint64_t>(groupBase) * (interleaved ? 4 : 1);
+        const uint16_t emptyLanes = interleaved ? InterleavedControlMatchMask(groupData, 0)
+                                                : ControlMatchMask(groupData, 0);
+        if (emptyLanes != 0) {
+          bucketIndex = groupBase + std::countr_zero(emptyLanes);
+        }
+        if (bucketIndex != bucketCount) {
+          break;
+        }
+      }
+      if (bucketIndex == bucketCount) {
+        return Status::Corruption("row control table is unexpectedly full");
+      }
+      if (interleaved) {
+        std::byte* bucket =
+            block.data() + localIndexOffset + static_cast<uint64_t>(bucketIndex) * 4;
+        bucket[0] = static_cast<std::byte>(fingerprint);
+        WriteRecordOffset(bucket + 1, recordCursor, recordOffsetWidth);
+      } else {
+        block[localIndexOffset + bucketIndex] = static_cast<std::byte>(fingerprint);
+        WriteRecordOffset(
+            block.data() + offsetsOffset + static_cast<uint64_t>(bucketIndex) * recordOffsetWidth,
+            recordCursor, recordOffsetWidth);
+      }
 
       std::byte* record = block.data() + recordsOffset + recordCursor;
-      recordCursor += static_cast<uint32_t>(
-          WriteVarint32(record, static_cast<uint32_t>(entry.key.size())));
+      const std::string_view suffix = EntrySuffix(encoding, temporarySlot.entryIndex, entry.key);
+      recordCursor +=
+          static_cast<uint32_t>(WriteVarint32(record, static_cast<uint32_t>(suffix.size())));
       record = block.data() + recordsOffset + recordCursor;
-      recordCursor += static_cast<uint32_t>(
-          WriteVarint32(record, static_cast<uint32_t>(entry.value.size())));
-      if (!entry.key.empty()) {
-        std::memcpy(block.data() + recordsOffset + recordCursor, entry.key.data(), entry.key.size());
+      recordCursor +=
+          static_cast<uint32_t>(WriteVarint32(record, static_cast<uint32_t>(entry.value.size())));
+      if (!encoding.prefixes.empty()) {
+        block[recordsOffset + recordCursor++] =
+            static_cast<std::byte>(encoding.prefixIdsByEntry[temporarySlot.entryIndex]);
       }
-      recordCursor += static_cast<uint32_t>(entry.key.size());
+      const uint32_t encodedSuffixSize =
+          PackedByteCount(static_cast<uint32_t>(suffix.size()), encoding.bitsPerSymbol);
+      WriteEncodedSuffix(block.data() + recordsOffset + recordCursor, suffix, encoding);
+      recordCursor += encodedSuffixSize;
       if (!entry.value.empty()) {
         std::memcpy(block.data() + recordsOffset + recordCursor, entry.value.data(),
                     entry.value.size());
@@ -1832,13 +2669,24 @@ class Database::Impl {
     if (header.columnSize != column.size()) {
       return Status::Ok();
     }
-    std::string storedColumn(header.columnSize, '\0');
-    status = ReadRowAt(bucket.shardId, storedColumn.data(), storedColumn.size(),
-                       bucket.blockOffset + sizeof(header));
-    if (!status) {
-      return status;
+    const RowShard& shard = *rowShards_[bucket.shardId];
+    if (shard.map.IsMapped()) {
+      const uint64_t columnOffset = bucket.blockOffset + sizeof(header);
+      if (columnOffset > shard.map.Size() || column.size() > shard.map.Size() - columnOffset) {
+        return Status::Corruption("row column extends beyond its value file");
+      }
+      const char* storedColumn = reinterpret_cast<const char*>(
+          static_cast<const std::byte*>(shard.map.Data()) + columnOffset);
+      matches = std::memcmp(storedColumn, column.data(), column.size()) == 0;
+    } else {
+      std::string storedColumn(header.columnSize, '\0');
+      status = ReadRowAt(bucket.shardId, storedColumn.data(), storedColumn.size(),
+                         bucket.blockOffset + sizeof(header));
+      if (!status) {
+        return status;
+      }
+      matches = storedColumn == column;
     }
-    matches = storedColumn == column;
     if (matches && outputHeader != nullptr) {
       *outputHeader = header;
     }
@@ -1849,14 +2697,17 @@ class Database::Impl {
     if (header.magic != detail::kRowBlockMagic || header.version != detail::kStorageVersion ||
         header.headerSize != sizeof(detail::RowBlockHeader) || header.columnHash == 0 ||
         header.sequence == 0 || !std::has_single_bit(header.bucketCount) ||
-        header.bucketCount < 2 || header.itemCount > header.bucketCount) {
+        header.bucketCount < kControlGroupWidth || header.itemCount > header.bucketCount ||
+        (header.recordOffsetWidth != 3 && header.recordOffsetWidth != 4) ||
+        header.keyMetadataBytesSize < sizeof(detail::RowKeyMetadataHeader)) {
       return Status::Corruption("row block header is invalid");
     }
-    const uint64_t bucketOffset = AlignUp8(sizeof(detail::RowBlockHeader) + header.columnSize);
-    uint64_t bucketBytes = 0;
+    const uint64_t metadataOffset = AlignUp8(sizeof(detail::RowBlockHeader) + header.columnSize);
+    const uint64_t localIndexOffset = AlignUp64(metadataOffset + header.keyMetadataBytesSize);
+    uint64_t localIndexBytes = 0;
     uint64_t expectedSize = 0;
-    if (!CheckedMultiply(header.bucketCount, sizeof(detail::RowKeyBucket), bucketBytes) ||
-        !CheckedAdd(bucketOffset, bucketBytes, expectedSize) ||
+    if (!CheckedMultiply(header.bucketCount, header.recordOffsetWidth + 1, localIndexBytes) ||
+        !CheckedAdd(localIndexOffset, localIndexBytes, expectedSize) ||
         !CheckedAdd(expectedSize, header.recordBytesSize, expectedSize) ||
         expectedSize != header.blockSize) {
       return Status::Corruption("row block size is invalid");
@@ -1887,6 +2738,7 @@ class Database::Impl {
       partition->buffer.clear();
       partition->persistedSize = 0;
       partition->used = false;
+      partition->spilled = false;
     }
     return RemoveStageFiles();
   }
@@ -1970,6 +2822,7 @@ class Database::Impl {
     targetEntriesPerRow_ = 0;
     shardCount_ = 0;
     spillPartitionCount_ = 0;
+    stageMemoryLimitPerPartition_ = 0;
   }
 
   std::filesystem::path directory_;
@@ -1995,6 +2848,7 @@ class Database::Impl {
   uint32_t targetEntriesPerRow_ = 0;
   uint32_t shardCount_ = 0;
   uint32_t spillPartitionCount_ = 0;
+  uint64_t stageMemoryLimitPerPartition_ = 0;
   bool open_ = false;
   bool readOnly_ = false;
 };

@@ -9,12 +9,12 @@ namespace LumoDB::detail {
 static_assert(std::endian::native == std::endian::little,
               "LumoDB currently stores fixed headers in little-endian form");
 
-inline constexpr uint32_t kStorageVersion = 3;
-inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R', 'V', '0', '0', '3'};
-inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R', 'I', '0', '0', '4'};
-inline constexpr std::array<char, 8> kStageFileMagic = {'L', 'U', 'M', 'S', 'T', '0', '0', '2'};
-inline constexpr uint32_t kRowBlockMagic = 0x33424f52;     // "ROB3".
-inline constexpr uint32_t kStageRecordMagic = 0x32544753;  // "SGT2".
+inline constexpr uint32_t kStorageVersion = 4;
+inline constexpr std::array<char, 8> kRowValueFileMagic = {'L', 'U', 'M', 'R', 'V', '0', '0', '4'};
+inline constexpr std::array<char, 8> kRowIndexFileMagic = {'L', 'U', 'M', 'R', 'I', '0', '0', '5'};
+inline constexpr std::array<char, 8> kStageFileMagic = {'L', 'U', 'M', 'S', 'T', '0', '0', '3'};
+inline constexpr uint32_t kRowBlockMagic = 0x34424f52;    // "ROB4".
+inline constexpr uint32_t kStageChunkMagic = 0x33434753;  // "SGC3".
 inline constexpr uint64_t kRoutingSeed = 0x9e3779b97f4a7c15ULL;
 
 struct RowValueFileHeader {
@@ -65,19 +65,28 @@ struct RowBlockHeader {
   uint32_t columnSize = 0;
   uint32_t itemCount = 0;
   uint32_t bucketCount = 0;
+  uint32_t keyMetadataBytesSize = 0;
   uint32_t recordBytesSize = 0;
   uint32_t blockSize = 0;
+  uint8_t recordOffsetWidth = 0;
+  std::array<uint8_t, 3> reserved8{};
   uint32_t reserved32 = 0;
   uint64_t reserved64 = 0;
 };
 
-// Compact 8-byte local bucket. keyFingerprint == 0 means empty. recordOffset
-// is relative to the row's packed record region. The full key stored in the
-// record is always compared, so a 32-bit fingerprint collision is harmless.
-struct RowKeyBucket {
-  uint32_t keyFingerprint = 0;
-  uint32_t recordOffset = 0;
+// Stored before the local control/offset arrays. Prefixes are addressed by a
+// one-byte ID in each record. Suffix bytes are either raw (bitsPerSymbol == 8)
+// or losslessly packed through the stored row-local alphabet.
+struct RowKeyMetadataHeader {
+  uint8_t bitsPerSymbol = 8;
+  uint8_t alphabetSize = 0;
+  uint16_t prefixCount = 0;
+  uint32_t prefixBytesSize = 0;
 };
+
+// After key metadata, 24-bit rows store sixteen interleaved
+// {control, offset[3]} buckets per aligned 64-byte group. A 32-bit row stores
+// one contiguous control byte per bucket followed by four-byte offsets.
 
 struct StageFileHeader {
   std::array<char, 8> magic = kStageFileMagic;
@@ -88,25 +97,27 @@ struct StageFileHeader {
   uint64_t reserved = 0;
 };
 
-struct StageRecordHeader {
-  uint32_t magic = kStageRecordMagic;
+// A chunk shares column and row metadata across all of its records. Each
+// record then stores only keyHash, varint key/value sizes, key bytes, and value
+// bytes. chunkSize includes this header, the column, and every record.
+struct StageChunkHeader {
+  uint32_t magic = kStageChunkMagic;
   uint16_t version = kStorageVersion;
-  uint16_t headerSize = sizeof(StageRecordHeader);
+  uint16_t headerSize = sizeof(StageChunkHeader);
+  uint32_t chunkSize = 0;
+  uint32_t recordCount = 0;
   uint64_t columnHash = 0;
-  uint64_t keyHash = 0;
   uint64_t rowId = 0;
   uint32_t columnSize = 0;
-  uint32_t keySize = 0;
-  uint32_t valueSize = 0;
   uint32_t reserved = 0;
 };
 
 static_assert(sizeof(RowValueFileHeader) == 24);
 static_assert(sizeof(RowIndexFileHeader) == 96);
 static_assert(sizeof(RowIndexBucket) == 48);
-static_assert(sizeof(RowBlockHeader) == 64);
-static_assert(sizeof(RowKeyBucket) == 8);
+static_assert(sizeof(RowBlockHeader) == 72);
+static_assert(sizeof(RowKeyMetadataHeader) == 8);
 static_assert(sizeof(StageFileHeader) == 32);
-static_assert(sizeof(StageRecordHeader) == 48);
+static_assert(sizeof(StageChunkHeader) == 40);
 
 }  // namespace LumoDB::detail

@@ -26,6 +26,7 @@ struct Options {
   uint64_t memoryBytes = 64ULL * 1024 * 1024 * 1024;
   uint64_t reads = 10'000;
   uint32_t batchSize = 1;
+  uint32_t keyPrefixBytes = 0;
   bool keep = false;
 };
 
@@ -59,12 +60,15 @@ Options ParseOptions(int argc, char** argv) {
       options.reads = std::stoull(std::string(next()));
     } else if (argument == "--batch-size") {
       options.batchSize = static_cast<uint32_t>(std::stoul(std::string(next())));
+    } else if (argument == "--key-prefix-bytes") {
+      options.keyPrefixBytes = static_cast<uint32_t>(std::stoul(std::string(next())));
     } else if (argument == "--keep") {
       options.keep = true;
     } else if (argument == "--help") {
       std::cout << "lumodb_bench [--dir PATH] [--entries N] [--value-bytes N] "
                    "[--threads N] [--row-shards N] [--explicit-rows N] "
                    "[--memory-gb N] [--reads N] [--batch-size N] "
+                   "[--key-prefix-bytes N] "
                    "[--keep]\n";
       std::exit(EXIT_SUCCESS);
     } else {
@@ -84,7 +88,9 @@ Options ParseOptions(int argc, char** argv) {
   return options;
 }
 
-std::string Key(uint64_t index) { return "key-" + std::to_string(index); }
+std::string Key(uint64_t index, uint32_t prefixBytes) {
+  return std::string(prefixBytes, 'p') + "key-" + std::to_string(index);
+}
 
 double Seconds(std::chrono::steady_clock::duration duration) {
   return std::chrono::duration<double>(duration).count();
@@ -116,7 +122,7 @@ int main(int argc, char** argv) {
 
   LumoDB::DatabaseOptions options;
   options.expectedEntryCountPerColumn = arguments.entries;
-  options.averageKeyBytes = 16;
+  options.averageKeyBytes = 16 + arguments.keyPrefixBytes;
   options.averageValueBytes = arguments.valueBytes;
   options.expectedExplicitRowCount = arguments.explicitRows;
   options.expectedExplicitEntryCount = arguments.explicitRows == 0 ? 0 : arguments.entries;
@@ -133,7 +139,8 @@ int main(int argc, char** argv) {
             << " routes=" << layout.routeCountPerColumn
             << " explicit_rows=" << arguments.explicitRows << " row_shards=" << layout.rowShardCount
             << " spill_partitions=" << layout.spillPartitionCount
-            << " batch_size=" << arguments.batchSize << '\n';
+            << " batch_size=" << arguments.batchSize
+            << " key_prefix_bytes=" << arguments.keyPrefixBytes << '\n';
 
   std::vector<std::byte> payload(arguments.valueBytes, std::byte{0x5a});
   const auto putStart = std::chrono::steady_clock::now();
@@ -166,7 +173,7 @@ int main(int argc, char** argv) {
         };
         if (arguments.explicitRows == 0) {
           for (uint64_t index = threadId; index < arguments.entries; index += arguments.threads) {
-            keys.push_back(Key(index));
+            keys.push_back(Key(index, arguments.keyPrefixBytes));
             if (keys.size() == arguments.batchSize) {
               flushAutomaticBatch();
             }
@@ -179,7 +186,7 @@ int main(int argc, char** argv) {
           for (uint64_t rowId = threadId; rowId < usedRows; rowId += arguments.threads) {
             for (uint64_t index = rowId; index < arguments.entries;
                  index += arguments.explicitRows) {
-              keys.push_back(Key(index));
+              keys.push_back(Key(index, arguments.keyPrefixBytes));
               if (keys.size() == arguments.batchSize) {
                 flushExplicitBatch(rowId);
               }
@@ -194,8 +201,9 @@ int main(int argc, char** argv) {
       for (uint64_t index = threadId; index < arguments.entries; index += arguments.threads) {
         const LumoDB::Status status =
             arguments.explicitRows == 0
-                ? database.Put("objects", Key(index), payload)
-                : database.Put("objects", index % arguments.explicitRows, Key(index), payload);
+                ? database.Put("objects", Key(index, arguments.keyPrefixBytes), payload)
+                : database.Put("objects", index % arguments.explicitRows,
+                               Key(index, arguments.keyPrefixBytes), payload);
         Check(status, "Put");
       }
     });
@@ -226,8 +234,9 @@ int main(int argc, char** argv) {
     const auto start = std::chrono::steady_clock::now();
     const LumoDB::Status status =
         arguments.explicitRows == 0
-            ? database.Get("objects", Key(index), value)
-            : database.GetRowStruct("objects", index % arguments.explicitRows, Key(index), value);
+            ? database.Get("objects", Key(index, arguments.keyPrefixBytes), value)
+            : database.GetRowStruct("objects", index % arguments.explicitRows,
+                                    Key(index, arguments.keyPrefixBytes), value);
     Check(status, "Get");
     const auto end = std::chrono::steady_clock::now();
     if (value != payload) {

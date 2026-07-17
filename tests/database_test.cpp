@@ -159,8 +159,7 @@ TEST(DatabaseTest, PutStructsStagesAutomaticBatchAndPersistsUpdates) {
   ASSERT_OK(database.Put("batch", "single", "single-value"));
 
   std::vector<std::byte> value;
-  EXPECT_EQ(database.Get("batch", "binary", value).Code(),
-            LumoDB::StatusCode::kInvalidArgument);
+  EXPECT_EQ(database.Get("batch", "binary", value).Code(), LumoDB::StatusCode::kInvalidArgument);
   ASSERT_OK(database.Flush());
   EXPECT_EQ(database.EntryCount(), 6);
   ASSERT_OK(database.Get("batch", "binary", value));
@@ -195,8 +194,7 @@ TEST(DatabaseTest, PutStructsStagesAutomaticBatchAndPersistsUpdates) {
   ASSERT_OK(database.OpenReadOnly(directory));
   ASSERT_OK(database.Get("batch", "close", value));
   EXPECT_EQ(value, closeFlushed);
-  EXPECT_EQ(database.PutStructs("batch", updates).Code(),
-            LumoDB::StatusCode::kInvalidArgument);
+  EXPECT_EQ(database.PutStructs("batch", updates).Code(), LumoDB::StatusCode::kInvalidArgument);
 }
 
 TEST(DatabaseTest, PutStructsPreservesDuplicateOrderAcrossRoutingChunks) {
@@ -390,6 +388,278 @@ TEST(DatabaseTest, PackedRowsHandleVarintBoundariesAndFingerprintCollisions) {
   EXPECT_EQ(value, value16384);
 }
 
+TEST(DatabaseTest, AdaptiveKeyEncodingUsesPrefixesAndFourBitAlphabet) {
+  const auto directory = LumoDB::test::MakeTestDirectory("adaptive-key-prefix");
+  LumoDB::DatabaseOptions options = TestOptions(1'000);
+  options.rowShardCount = 1;
+  options.spillPartitionCount = 1;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  const std::string prefix(32, 'p');
+  std::vector<std::string> keys;
+  std::vector<std::vector<std::byte>> values;
+  keys.reserve(128);
+  values.reserve(128);
+  for (uint32_t index = 0; index < 128; ++index) {
+    std::string suffix(16, '0');
+    uint32_t value = index;
+    for (size_t digit = 0; digit < 8; ++digit) {
+      const uint32_t nibble = value & 0xf;
+      suffix[15 - digit] = static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10);
+      value >>= 4;
+    }
+    keys.push_back(prefix + suffix);
+    values.push_back(LumoDB::test::MakeBytes("value-" + std::to_string(index)));
+  }
+  std::vector<LumoDB::RowStructEntry> entries;
+  entries.reserve(keys.size());
+  for (size_t index = 0; index < keys.size(); ++index) {
+    entries.push_back(LumoDB::RowStructEntry{.key = keys[index], .flatBufferBytes = values[index]});
+  }
+  ASSERT_OK(database.PutRowStructs("encoded", 7, entries));
+  ASSERT_OK(database.Flush());
+  const std::vector<std::byte> updatedValue = LumoDB::test::MakeBytes("updated-value");
+  const std::array<LumoDB::RowStructEntry, 1> update = {
+      LumoDB::RowStructEntry{.key = keys[63], .flatBufferBytes = updatedValue},
+  };
+  ASSERT_OK(database.PutRowStructs("encoded", 7, update));
+  ASSERT_OK(database.Close());
+
+  LumoDB::detail::FileDescriptor file;
+  ASSERT_OK(LumoDB::detail::OpenReadOnly(directory / "row_values-000.lumorv", file));
+  LumoDB::detail::RowBlockHeader rowHeader;
+  const uint64_t blockOffset = sizeof(LumoDB::detail::RowValueFileHeader);
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &rowHeader, sizeof(rowHeader), blockOffset));
+  const uint64_t metadataOffset = (sizeof(rowHeader) + rowHeader.columnSize + 7) & ~uint64_t{7};
+  LumoDB::detail::RowKeyMetadataHeader keyHeader;
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &keyHeader, sizeof(keyHeader),
+                                      blockOffset + metadataOffset));
+  EXPECT_EQ(rowHeader.recordOffsetWidth, 3);
+  EXPECT_GT(keyHeader.prefixCount, 0);
+  EXPECT_EQ(keyHeader.bitsPerSymbol, 4);
+  file.Reset();
+
+  ASSERT_OK(database.OpenReadOnly(directory));
+  std::vector<std::byte> actual;
+  for (const size_t index : {size_t{0}, size_t{63}, size_t{127}}) {
+    ASSERT_OK(database.GetRowStruct("encoded", 7, keys[index], actual));
+    EXPECT_EQ(actual, index == 63 ? updatedValue : values[index]);
+  }
+  EXPECT_EQ(database.GetRowStruct("encoded", 7, prefix + "ffffffffffffffff", actual).Code(),
+            LumoDB::StatusCode::kNotFound);
+}
+
+TEST(DatabaseTest, AdaptiveKeyEncodingKeepsHighEntropyBinaryKeysRaw) {
+  const auto directory = LumoDB::test::MakeTestDirectory("adaptive-key-raw");
+  LumoDB::DatabaseOptions options = TestOptions(1'000);
+  options.rowShardCount = 1;
+  options.spillPartitionCount = 1;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  std::vector<std::string> keys;
+  keys.reserve(100);
+  for (uint32_t index = 0; index < 100; ++index) {
+    std::string key(256, '\0');
+    for (uint32_t byte = 0; byte < key.size(); ++byte) {
+      key[byte] = static_cast<char>((index * 131 + byte) & 0xff);
+    }
+    keys.push_back(std::move(key));
+  }
+  const std::vector<std::byte> storedValue = LumoDB::test::MakeBytes("binary-value");
+  std::vector<LumoDB::RowStructEntry> entries;
+  entries.reserve(keys.size());
+  for (const std::string& key : keys) {
+    entries.push_back(LumoDB::RowStructEntry{.key = key, .flatBufferBytes = storedValue});
+  }
+  ASSERT_OK(database.PutRowStructs("binary", 1, entries));
+  ASSERT_OK(database.Close());
+
+  LumoDB::detail::FileDescriptor file;
+  ASSERT_OK(LumoDB::detail::OpenReadOnly(directory / "row_values-000.lumorv", file));
+  LumoDB::detail::RowBlockHeader rowHeader;
+  const uint64_t blockOffset = sizeof(LumoDB::detail::RowValueFileHeader);
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &rowHeader, sizeof(rowHeader), blockOffset));
+  const uint64_t metadataOffset = (sizeof(rowHeader) + rowHeader.columnSize + 7) & ~uint64_t{7};
+  LumoDB::detail::RowKeyMetadataHeader keyHeader;
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &keyHeader, sizeof(keyHeader),
+                                      blockOffset + metadataOffset));
+  EXPECT_EQ(keyHeader.prefixCount, 0);
+  EXPECT_EQ(keyHeader.bitsPerSymbol, 8);
+  file.Reset();
+
+  ASSERT_OK(database.OpenReadOnly(directory));
+  std::vector<std::byte> actual;
+  ASSERT_OK(database.GetRowStruct("binary", 1, keys[37], actual));
+  EXPECT_EQ(actual, storedValue);
+}
+
+TEST(DatabaseTest, AdaptiveKeyEncodingUsesSixBitAlphabetLosslessly) {
+  const auto directory = LumoDB::test::MakeTestDirectory("adaptive-key-six-bit");
+  LumoDB::DatabaseOptions options = TestOptions(1'000);
+  options.rowShardCount = 1;
+  options.spillPartitionCount = 1;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  std::vector<std::string> keys;
+  keys.reserve(32);
+  for (uint32_t index = 0; index < 32; ++index) {
+    std::string key(128, '\0');
+    key[0] = static_cast<char>(index);
+    for (uint32_t byte = 1; byte < key.size(); ++byte) {
+      key[byte] = static_cast<char>(32 + ((index + byte) & 31));
+    }
+    keys.push_back(std::move(key));
+  }
+  const std::vector<std::byte> storedValue = LumoDB::test::MakeBytes("six-bit-value");
+  std::vector<LumoDB::RowStructEntry> entries;
+  entries.reserve(keys.size());
+  for (const std::string& key : keys) {
+    entries.push_back(LumoDB::RowStructEntry{.key = key, .flatBufferBytes = storedValue});
+  }
+  ASSERT_OK(database.PutRowStructs("six-bit", 3, entries));
+  ASSERT_OK(database.Close());
+
+  LumoDB::detail::FileDescriptor file;
+  ASSERT_OK(LumoDB::detail::OpenReadOnly(directory / "row_values-000.lumorv", file));
+  LumoDB::detail::RowBlockHeader rowHeader;
+  const uint64_t blockOffset = sizeof(LumoDB::detail::RowValueFileHeader);
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &rowHeader, sizeof(rowHeader), blockOffset));
+  const uint64_t metadataOffset = (sizeof(rowHeader) + rowHeader.columnSize + 7) & ~uint64_t{7};
+  LumoDB::detail::RowKeyMetadataHeader keyHeader;
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &keyHeader, sizeof(keyHeader),
+                                      blockOffset + metadataOffset));
+  EXPECT_EQ(keyHeader.bitsPerSymbol, 6);
+  EXPECT_EQ(keyHeader.alphabetSize, 64);
+  file.Reset();
+
+  ASSERT_OK(database.OpenReadOnly(directory));
+  std::vector<std::byte> actual;
+  for (const size_t index : {size_t{0}, size_t{17}, size_t{31}}) {
+    ASSERT_OK(database.GetRowStruct("six-bit", 3, keys[index], actual));
+    EXPECT_EQ(actual, storedValue);
+  }
+}
+
+TEST(DatabaseTest, AdaptivePrefixDictionaryHandlesMultiplePrefixesAndRawKeys) {
+  const auto directory = LumoDB::test::MakeTestDirectory("adaptive-key-mixed-prefixes");
+  LumoDB::DatabaseOptions options = TestOptions(1'000);
+  options.rowShardCount = 1;
+  options.spillPartitionCount = 1;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+
+  std::vector<std::string> keys;
+  for (uint32_t index = 0; index < 64; ++index) {
+    keys.push_back(std::string(32, 'a') + "suffix-" + std::to_string(index));
+    keys.push_back(std::string(32, 'b') + "suffix-" + std::to_string(index));
+  }
+  for (uint32_t index = 0; index < 8; ++index) {
+    std::string key(128, '\0');
+    for (uint32_t byte = 0; byte < key.size(); ++byte) {
+      key[byte] = static_cast<char>((index * 29 + byte * 17) & 0xff);
+    }
+    keys.push_back(std::move(key));
+  }
+  const std::vector<std::byte> storedValue = LumoDB::test::MakeBytes("mixed-prefix-value");
+  std::vector<LumoDB::RowStructEntry> entries;
+  entries.reserve(keys.size());
+  for (const std::string& key : keys) {
+    entries.push_back(LumoDB::RowStructEntry{.key = key, .flatBufferBytes = storedValue});
+  }
+  ASSERT_OK(database.PutRowStructs("mixed-prefix", 4, entries));
+  ASSERT_OK(database.Close());
+
+  LumoDB::detail::FileDescriptor file;
+  ASSERT_OK(LumoDB::detail::OpenReadOnly(directory / "row_values-000.lumorv", file));
+  LumoDB::detail::RowBlockHeader rowHeader;
+  const uint64_t blockOffset = sizeof(LumoDB::detail::RowValueFileHeader);
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &rowHeader, sizeof(rowHeader), blockOffset));
+  const uint64_t metadataOffset = (sizeof(rowHeader) + rowHeader.columnSize + 7) & ~uint64_t{7};
+  LumoDB::detail::RowKeyMetadataHeader keyHeader;
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &keyHeader, sizeof(keyHeader),
+                                      blockOffset + metadataOffset));
+  EXPECT_GE(keyHeader.prefixCount, 2);
+  EXPECT_EQ(keyHeader.bitsPerSymbol, 8);
+  file.Reset();
+
+  ASSERT_OK(database.OpenReadOnly(directory));
+  std::vector<std::byte> actual;
+  for (const size_t index : {size_t{0}, size_t{65}, size_t{131}, size_t{135}}) {
+    ASSERT_OK(database.GetRowStruct("mixed-prefix", 4, keys[index], actual));
+    EXPECT_EQ(actual, storedValue);
+  }
+}
+
+TEST(DatabaseTest, RecordOffsetsAdaptBetween24And32Bits) {
+  const auto directory = LumoDB::test::MakeTestDirectory("adaptive-record-offsets");
+  LumoDB::DatabaseOptions options = TestOptions(10);
+  options.rowShardCount = 1;
+  options.spillPartitionCount = 1;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+  ASSERT_OK(database.Put("offsets", 1, "small-key", "small-value"));
+  const std::vector<std::byte> largeValue(16 * 1024 * 1024, std::byte{0x5a});
+  const std::array<LumoDB::RowStructEntry, 1> largeEntry = {
+      LumoDB::RowStructEntry{.key = "large-key", .flatBufferBytes = largeValue},
+  };
+  ASSERT_OK(database.PutRowStructs("offsets", 2, largeEntry));
+  ASSERT_OK(database.Close());
+
+  LumoDB::detail::FileDescriptor file;
+  ASSERT_OK(LumoDB::detail::OpenReadOnly(directory / "row_values-000.lumorv", file));
+  LumoDB::detail::RowBlockHeader smallHeader;
+  uint64_t blockOffset = sizeof(LumoDB::detail::RowValueFileHeader);
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &smallHeader, sizeof(smallHeader), blockOffset));
+  EXPECT_EQ(smallHeader.recordOffsetWidth, 3);
+  blockOffset += smallHeader.blockSize;
+  LumoDB::detail::RowBlockHeader largeHeader;
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &largeHeader, sizeof(largeHeader), blockOffset));
+  EXPECT_EQ(largeHeader.recordOffsetWidth, 4);
+}
+
+TEST(DatabaseTest, StagingStaysInMemoryAndSpillsOnlyAfterItsBudget) {
+  auto hasStageFile = [](const std::filesystem::path& directory) {
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+      if (entry.path().filename().string().starts_with("stage-")) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const auto memoryDirectory = LumoDB::test::MakeTestDirectory("memory-first-stage");
+  LumoDB::DatabaseOptions memoryOptions = TestOptions(1'000);
+  memoryOptions.rowShardCount = 1;
+  memoryOptions.spillPartitionCount = 1;
+  LumoDB::Database memoryDatabase;
+  ASSERT_OK(memoryDatabase.Open(memoryDirectory, memoryOptions));
+  ASSERT_OK(memoryDatabase.Put("column", 1, "key", "value"));
+  EXPECT_FALSE(hasStageFile(memoryDirectory));
+  ASSERT_OK(memoryDatabase.Flush());
+  EXPECT_FALSE(hasStageFile(memoryDirectory));
+
+  const auto spillDirectory = LumoDB::test::MakeTestDirectory("spill-fallback-stage");
+  LumoDB::DatabaseOptions spillOptions = TestOptions(1'000);
+  spillOptions.rowShardCount = 1;
+  spillOptions.spillPartitionCount = 128;
+  LumoDB::Database spillDatabase;
+  ASSERT_OK(spillDatabase.Open(spillDirectory, spillOptions));
+  const std::vector<std::byte> largeValue(300 * 1024, std::byte{0x6b});
+  const std::array<LumoDB::RowStructEntry, 1> entry = {
+      LumoDB::RowStructEntry{.key = "key", .flatBufferBytes = largeValue},
+  };
+  ASSERT_OK(spillDatabase.PutRowStructs("column", 1, entry));
+  EXPECT_TRUE(hasStageFile(spillDirectory));
+  ASSERT_OK(spillDatabase.Flush());
+  EXPECT_FALSE(hasStageFile(spillDirectory));
+  std::vector<std::byte> actual;
+  ASSERT_OK(spillDatabase.GetRowStruct("column", 1, "key", actual));
+  EXPECT_EQ(actual, largeValue);
+}
+
 TEST(DatabaseTest, AutomaticAndExplicitRowsCanCoexist) {
   const auto directory = LumoDB::test::MakeTestDirectory("mixed-row-routing");
   LumoDB::Database database;
@@ -519,8 +789,7 @@ TEST(DatabaseTest, PutStructsIsThreadSafeAcrossConcurrentBatches) {
 
   for (uint32_t threadId = 0; threadId < kThreads; ++threadId) {
     std::vector<std::byte> value;
-    ASSERT_OK(database.Get("parallel-batches",
-                           "key-" + std::to_string(threadId) + "-99-3", value));
+    ASSERT_OK(database.Get("parallel-batches", "key-" + std::to_string(threadId) + "-99-3", value));
     EXPECT_EQ(LumoDB::test::BytesToString(value), "value-99-3");
   }
 }
@@ -642,7 +911,8 @@ TEST(DatabaseTest, InterruptedBuildIsRejected) {
 #endif
 
 TEST(StorageFormatTest, HotBucketsAreCompact) {
-  EXPECT_EQ(sizeof(LumoDB::detail::RowKeyBucket), 8);
+  EXPECT_EQ(sizeof(LumoDB::detail::RowKeyMetadataHeader), 8);
+  EXPECT_EQ(sizeof(LumoDB::detail::StageChunkHeader), 40);
   EXPECT_EQ(sizeof(LumoDB::detail::RowIndexBucket), 48);
 }
 
@@ -660,25 +930,71 @@ TEST(StorageFormatTest, RejectsMalformedPackedRecordLengths) {
   LumoDB::detail::RowBlockHeader header;
   constexpr uint64_t blockOffset = sizeof(LumoDB::detail::RowValueFileHeader);
   ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &header, sizeof(header), blockOffset));
-  const uint64_t bucketOffset =
-      (sizeof(header) + header.columnSize + 7) & ~uint64_t{7};
-  LumoDB::detail::RowKeyBucket occupied;
+  const uint64_t metadataOffset = (sizeof(header) + header.columnSize + 7) & ~uint64_t{7};
+  const uint64_t localIndexOffset =
+      (metadataOffset + header.keyMetadataBytesSize + 63) & ~uint64_t{63};
+  uint32_t occupiedIndex = header.bucketCount;
   for (uint32_t index = 0; index < header.bucketCount; ++index) {
-    ASSERT_OK(LumoDB::detail::ReadAllAt(
-        file.Get(), &occupied, sizeof(occupied),
-        blockOffset + bucketOffset + static_cast<uint64_t>(index) * sizeof(occupied)));
-    if (occupied.keyFingerprint != 0) {
+    std::byte control{};
+    const uint64_t controlOffset = header.recordOffsetWidth == 3
+                                       ? localIndexOffset + static_cast<uint64_t>(index) * 4
+                                       : localIndexOffset + index;
+    ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &control, sizeof(control),
+                                        blockOffset + controlOffset));
+    if (control != std::byte{0}) {
+      occupiedIndex = index;
       break;
     }
   }
-  ASSERT_NE(occupied.keyFingerprint, 0U);
+  ASSERT_NE(occupiedIndex, header.bucketCount);
+  std::array<std::byte, 4> encodedOffset{};
+  const uint64_t encodedOffsetPosition =
+      header.recordOffsetWidth == 3
+          ? localIndexOffset + static_cast<uint64_t>(occupiedIndex) * 4 + 1
+          : localIndexOffset + header.bucketCount +
+                static_cast<uint64_t>(occupiedIndex) * header.recordOffsetWidth;
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), encodedOffset.data(), header.recordOffsetWidth,
+                                      blockOffset + encodedOffsetPosition));
+  uint32_t recordOffset = std::to_integer<uint8_t>(encodedOffset[0]) |
+                          (static_cast<uint32_t>(std::to_integer<uint8_t>(encodedOffset[1])) << 8) |
+                          (static_cast<uint32_t>(std::to_integer<uint8_t>(encodedOffset[2])) << 16);
+  if (header.recordOffsetWidth == 4) {
+    recordOffset |= static_cast<uint32_t>(std::to_integer<uint8_t>(encodedOffset[3])) << 24;
+  }
   const uint64_t recordsOffset =
-      bucketOffset + static_cast<uint64_t>(header.bucketCount) * sizeof(occupied);
+      localIndexOffset + static_cast<uint64_t>(header.bucketCount) * (header.recordOffsetWidth + 1);
   const std::array<std::byte, 5> malformed = {
       std::byte{0x80}, std::byte{0x80}, std::byte{0x80}, std::byte{0x80}, std::byte{0x80},
   };
   ASSERT_OK(LumoDB::detail::WriteAllAt(file.Get(), malformed.data(), malformed.size(),
-                                      blockOffset + recordsOffset + occupied.recordOffset));
+                                       blockOffset + recordsOffset + recordOffset));
+  ASSERT_OK(LumoDB::detail::SyncFile(file.Get()));
+  file.Reset();
+
+  ASSERT_OK(database.OpenReadOnly(directory));
+  std::vector<std::byte> value;
+  EXPECT_EQ(database.GetRowStruct("column", 0, "key", value).Code(),
+            LumoDB::StatusCode::kCorruption);
+}
+
+TEST(StorageFormatTest, RejectsMalformedAdaptiveKeyMetadata) {
+  const auto directory = LumoDB::test::MakeTestDirectory("corrupt-key-metadata");
+  LumoDB::DatabaseOptions options = TestOptions(100);
+  options.rowShardCount = 1;
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+  ASSERT_OK(database.Put("column", 0, "key", "value"));
+  ASSERT_OK(database.Close());
+
+  LumoDB::detail::FileDescriptor file;
+  ASSERT_OK(LumoDB::detail::OpenReadWriteCreate(directory / "row_values-000.lumorv", file));
+  LumoDB::detail::RowBlockHeader header;
+  constexpr uint64_t blockOffset = sizeof(LumoDB::detail::RowValueFileHeader);
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &header, sizeof(header), blockOffset));
+  const uint64_t metadataOffset = (sizeof(header) + header.columnSize + 7) & ~uint64_t{7};
+  const std::byte invalidBitsPerSymbol{5};
+  ASSERT_OK(LumoDB::detail::WriteAllAt(file.Get(), &invalidBitsPerSymbol,
+                                       sizeof(invalidBitsPerSymbol), blockOffset + metadataOffset));
   ASSERT_OK(LumoDB::detail::SyncFile(file.Get()));
   file.Reset();
 
@@ -700,13 +1016,11 @@ TEST(DatabaseTest, ReportsInvalidStateAndArguments) {
   };
   EXPECT_EQ(database.Get("column", "key", value).Code(), LumoDB::StatusCode::kNotOpen);
   EXPECT_EQ(database.Put("column", "key", "value").Code(), LumoDB::StatusCode::kNotOpen);
-  EXPECT_EQ(database.PutStructs("column", validEntries).Code(),
-            LumoDB::StatusCode::kNotOpen);
+  EXPECT_EQ(database.PutStructs("column", validEntries).Code(), LumoDB::StatusCode::kNotOpen);
   EXPECT_EQ(database.PutRowStructs("column", 0, validRowEntries).Code(),
             LumoDB::StatusCode::kNotOpen);
   std::vector<std::byte> bytes;
-  EXPECT_EQ(database.GetRowStruct("column", 0, "key", bytes).Code(),
-            LumoDB::StatusCode::kNotOpen);
+  EXPECT_EQ(database.GetRowStruct("column", 0, "key", bytes).Code(), LumoDB::StatusCode::kNotOpen);
 
   const auto directory = LumoDB::test::MakeTestDirectory("arguments");
   ASSERT_OK(database.Open(directory, TestOptions(100)));
@@ -716,8 +1030,7 @@ TEST(DatabaseTest, ReportsInvalidStateAndArguments) {
             LumoDB::StatusCode::kInvalidArgument);
   EXPECT_EQ(database.Get("column", "missing", value).Code(), LumoDB::StatusCode::kNotFound);
   ASSERT_OK(database.PutStructs("column", {}));
-  EXPECT_EQ(database.PutStructs("", validEntries).Code(),
-            LumoDB::StatusCode::kInvalidArgument);
+  EXPECT_EQ(database.PutStructs("", validEntries).Code(), LumoDB::StatusCode::kInvalidArgument);
   const std::array<LumoDB::StructEntry, 2> partiallyInvalidAutomaticEntries = {
       validEntries.front(),
       LumoDB::StructEntry{.key = "", .flatBufferBytes = rowValue},

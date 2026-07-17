@@ -113,10 +113,12 @@ Use `Database::Layout()` after Open to inspect the persisted choice.
 
 ## Write path
 
-Each Put resolves either an automatic or explicit row ID, then copies a compact
-record into a mutex-protected, memory-bounded spill-partition buffer. Full
-buffers are written sequentially. There is no mmap random write per key and no
-global one-bucket-per-key table.
+Each Put resolves either an automatic or explicit row ID. Batch writes are
+stored as compact `(column, resolved row ID)` chunks: the column and row are
+written once, followed by key hash, varint lengths, key, and value for each
+record. Partitions remain in RAM up to half of `memoryBudgetBytes`; only a
+partition that exceeds its share creates a stage file and spills sequentially.
+There is no mmap random write per key and no global one-bucket-per-key table.
 
 At Flush, spill partitions are processed in parallel:
 
@@ -131,9 +133,11 @@ This keeps the high-volume I/O sequential and avoids the cache-miss-heavy random
 index publication that made the former unique path stall.
 
 Spill files are temporary but require real disk space until Flush completes.
-Budget peak space for both the staged records and the final row files. For one
-billion 16-byte keys and 16-byte values, a practical allowance is roughly
-160-200 GiB, depending on column/key lengths.
+With enough memory no stage file is created. If staging spills, budget peak
+space for both compact chunks and final row files. For one billion 16-byte keys
+and 16-byte values, a conservative spilled-build allowance is roughly
+90-120 GiB, depending on column lengths and whether adaptive key encoding is
+profitable.
 
 ### Interrupted builds
 
@@ -155,12 +159,20 @@ Read-only Open mmaps the outer index and row-value shards. A random lookup does:
 3. probe the row's compact local key table;
 4. compare the stored key and copy the value.
 
-`RowKeyBucket` is 8 bytes and `RowIndexBucket` is 48 bytes. Each local bucket
-stores a 32-bit hash fingerprint plus a 32-bit offset into a packed record
-region. A record stores varint key/value lengths followed by adjacent key and
-value bytes. Empty buckets use `keyFingerprint == 0`; fingerprint matches are
-always verified against the full stored key, so collisions preserve exact
-lookup semantics. Row data itself remains immutable after publication.
+For the common row below 16 MiB, each local bucket co-locates one control byte
+and a 24-bit record offset in four bytes. Sixteen buckets form one aligned
+64-byte group, so ARM NEON or x86 SSE2 checks all fingerprints while loading one
+cache line. Rows above 16 MiB automatically use 32-bit offsets. The full key is
+always verified, so fingerprint collisions preserve exact lookup semantics.
+
+At Flush, every row independently compares raw keys with lossless adaptive
+encodings. Repeated 8/16/32-byte prefixes may be stored in a row-local prefix
+dictionary, and suffix alphabets of at most 16 or 64 bytes may use 4-bit or
+6-bit symbols. Short-key rows stay raw; otherwise encoding is selected only when
+the complete row is at least 10% smaller and saves at least eight bytes per key.
+High-entropy binary keys also stay raw. Read-only lookup compares raw or encoded
+key bytes directly in mmap without allocating a temporary stored-key string.
+Values remain uncompressed and are copied unchanged.
 
 ## Files
 
@@ -171,9 +183,9 @@ lookup semantics. Row data itself remains immutable after publication.
 | `stage-NNN.lumost` | temporary sequential spill files; removed after Flush |
 | `build.incomplete` | incomplete compiler-output marker |
 
-The v3 compact-row format is intentionally incompatible with databases created
-by the former object/unique or v2 24-byte-bucket formats. Rebuild those outputs
-in a fresh directory.
+The v4 adaptive-key format is intentionally incompatible with databases created
+by the former object/unique, v2 24-byte-bucket, or v3 compact-row formats.
+Rebuild those outputs in a fresh directory.
 
 ## Build and test
 
@@ -184,9 +196,10 @@ ctest --test-dir build --output-on-failure
 ```
 
 The test suite covers automatic/explicit row coexistence, duplicate resolution,
-updates across Flush calls, concurrent Put, packed-record varint boundaries,
-fingerprint collisions, malformed records, index growth, column isolation,
-read-only mmap access, and rejection of interrupted builds.
+updates across Flush calls, concurrent Put, RAM-first and spilled staging,
+4-bit/6-bit/raw key encodings, 24/32-bit offsets, packed-record varint
+boundaries, fingerprint collisions, malformed records, index growth, column
+isolation, read-only mmap access, and rejection of interrupted builds.
 
 ## Benchmark
 
@@ -199,10 +212,12 @@ read-only mmap access, and rejection of interrupted builds.
   --explicit-rows 0 \
   --memory-gb 128 \
   --reads 10000 \
+  --key-prefix-bytes 0 \
   --keep
 ```
 
 The benchmark reports the Put staging rate, parallel row-build/Flush rate,
 resulting disk size, and mmap random-read p50/p99 latency separately. Set
 `--explicit-rows` above zero to benchmark caller-selected row routing; zero uses
-automatic routing.
+automatic routing. `--key-prefix-bytes` adds a shared prefix to every generated
+key so adaptive prefix/alphabet encoding can be measured independently.
