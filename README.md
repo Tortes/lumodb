@@ -39,6 +39,7 @@ options.averageValueBytes = 256;
 options.writerThreadCount = 16;       // 0 = hardware concurrency
 options.rowShardCount = 16;           // 0 = automatic, capped at 32
 options.memoryBudgetBytes = 128ULL * 1024 * 1024 * 1024;
+options.oneShotBuild = true;           // Empty DB, unique keys, one Flush.
 
 LumoDB::Database db;
 LumoDB::Status status = db.Open("output.lumodb", options);
@@ -73,6 +74,12 @@ preserves input order, so the last duplicate key in a batch wins at `Flush`.
 holds each used spill-partition lock once per chunk instead of once per key.
 `GetRowStruct` restores the legacy explicit-row name and directly probes the
 specified row; it is equivalent to the explicit-row `Get` overload.
+
+`oneShotBuild` is intended for immutable compiler output. The database must be
+empty, the caller must guarantee every `(column, resolved row, key)` is unique,
+and no write is accepted after the first successful `Flush`. Duplicate keys are
+not checked and violate the mode's contract. The option is build-only and is
+not required by `OpenReadOnly`.
 
 `Put` is safe to call concurrently. `Flush`, `Close`, and `Get` must not race
 with Put calls. A batch becomes readable and durable at `Flush`; `Get` returns
@@ -128,6 +135,12 @@ At Flush, spill partitions are processed in parallel:
 - each new immutable row block is built contiguously;
 - a row shard appends the complete block under a short per-shard lock;
 - the small outer index is published after the block write succeeds.
+
+In `oneShotBuild` mode, each row uses a compact scratch table with one control
+byte and one 32-bit entry index per bucket. The selected bucket is reused when
+the entry index becomes a persisted record offset, eliminating the normal
+temporary dedup table and second hash-table insertion. Header, metadata, index,
+keys, and values retain the same contiguous v4 layout and read path.
 
 This keeps the high-volume I/O sequential and avoids the cache-miss-heavy random
 index publication that made the former unique path stall.
@@ -197,9 +210,10 @@ ctest --test-dir build --output-on-failure
 
 The test suite covers automatic/explicit row coexistence, duplicate resolution,
 updates across Flush calls, concurrent Put, RAM-first and spilled staging,
-4-bit/6-bit/raw key encodings, 24/32-bit offsets, packed-record varint
-boundaries, fingerprint collisions, malformed records, index growth, column
-isolation, read-only mmap access, and rejection of interrupted builds.
+one-shot lifecycle and readback, 4-bit/6-bit/raw key encodings,
+24/32-bit offsets, packed-record varint boundaries, fingerprint collisions,
+malformed records, index growth, column isolation, read-only mmap access, and
+rejection of interrupted builds.
 
 ## Benchmark
 
@@ -213,6 +227,7 @@ isolation, read-only mmap access, and rejection of interrupted builds.
   --memory-gb 128 \
   --reads 10000 \
   --key-prefix-bytes 0 \
+  --one-shot \
   --keep
 ```
 
@@ -221,3 +236,4 @@ resulting disk size, and mmap random-read p50/p99 latency separately. Set
 `--explicit-rows` above zero to benchmark caller-selected row routing; zero uses
 automatic routing. `--key-prefix-bytes` adds a shared prefix to every generated
 key so adaptive prefix/alphabet encoding can be measured independently.
+`--one-shot` enables the immutable single-pass row-index builder.

@@ -22,6 +22,7 @@ TEST(SystemTest, BuildsAndRandomlyReadsAParallelDataSet) {
   options.rowShardCount = kThreads;
   options.memoryBudgetBytes = 256ULL * 1024 * 1024;
   options.stageBufferBytes = 64 * 1024;
+  options.oneShotBuild = true;
 
   LumoDB::Database database;
   ASSERT_OK(database.Open(directory, options));

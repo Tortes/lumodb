@@ -70,6 +70,13 @@ struct DatabaseOptions {
   uint32_t stageBufferBytes = 256 * 1024;
   double maxLoadFactor = 0.80;
 
+  // Build an empty database exactly once. The caller guarantees every
+  // (column, resolved row, key) is unique; duplicates are not checked. No
+  // writes are accepted after the first successful Flush. This keeps the
+  // persisted v4 format unchanged while enabling a single-pass row index
+  // builder. OpenReadOnly need not repeat this option.
+  bool oneShotBuild = false;
+
   // Invoked synchronously at coarse phase boundaries. Keep it cheap.
   WriteProgressCallback writeProgress;
 };

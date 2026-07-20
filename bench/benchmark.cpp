@@ -27,6 +27,7 @@ struct Options {
   uint64_t reads = 10'000;
   uint32_t batchSize = 1;
   uint32_t keyPrefixBytes = 0;
+  bool oneShot = false;
   bool keep = false;
 };
 
@@ -62,6 +63,8 @@ Options ParseOptions(int argc, char** argv) {
       options.batchSize = static_cast<uint32_t>(std::stoul(std::string(next())));
     } else if (argument == "--key-prefix-bytes") {
       options.keyPrefixBytes = static_cast<uint32_t>(std::stoul(std::string(next())));
+    } else if (argument == "--one-shot") {
+      options.oneShot = true;
     } else if (argument == "--keep") {
       options.keep = true;
     } else if (argument == "--help") {
@@ -69,6 +72,7 @@ Options ParseOptions(int argc, char** argv) {
                    "[--threads N] [--row-shards N] [--explicit-rows N] "
                    "[--memory-gb N] [--reads N] [--batch-size N] "
                    "[--key-prefix-bytes N] "
+                   "[--one-shot] "
                    "[--keep]\n";
       std::exit(EXIT_SUCCESS);
     } else {
@@ -129,6 +133,7 @@ int main(int argc, char** argv) {
   options.writerThreadCount = arguments.threads;
   options.rowShardCount = arguments.rowShards;
   options.memoryBudgetBytes = arguments.memoryBytes;
+  options.oneShotBuild = arguments.oneShot;
 
   LumoDB::Database database;
   Check(database.Open(arguments.directory, options), "Open");
@@ -140,7 +145,8 @@ int main(int argc, char** argv) {
             << " explicit_rows=" << arguments.explicitRows << " row_shards=" << layout.rowShardCount
             << " spill_partitions=" << layout.spillPartitionCount
             << " batch_size=" << arguments.batchSize
-            << " key_prefix_bytes=" << arguments.keyPrefixBytes << '\n';
+            << " key_prefix_bytes=" << arguments.keyPrefixBytes << " one_shot=" << arguments.oneShot
+            << '\n';
 
   std::vector<std::byte> payload(arguments.valueBytes, std::byte{0x5a});
   const auto putStart = std::chrono::steady_clock::now();

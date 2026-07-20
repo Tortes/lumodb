@@ -494,6 +494,10 @@ class Database::Impl {
     if (writePoisoned_.load(std::memory_order_acquire)) {
       return Status::Corruption("write batch failed; delete the output directory and rebuild it");
     }
+    if (options_.oneShotBuild && !buildActive_.load(std::memory_order_acquire) &&
+        IndexHeader()->itemCount != 0) {
+      return Status::InvalidArgument("oneShotBuild accepts no writes after its first Flush");
+    }
     return Status::Ok();
   }
 
@@ -880,9 +884,22 @@ class Database::Impl {
     return key.substr(plan.prefixes[prefixId - 1].size());
   }
 
+  size_t EncodingEntryCount(std::span<const EntryView> entries,
+                            std::span<const uint32_t> uniqueEntryIndices) const {
+    return uniqueEntryIndices.empty() ? entries.size() : uniqueEntryIndices.size();
+  }
+
+  size_t EncodingEntryIndex(size_t position, std::span<const uint32_t> uniqueEntryIndices) const {
+    return uniqueEntryIndices.empty() ? position : uniqueEntryIndices[position];
+  }
+
   uint64_t MeasureEncoding(const KeyEncodingPlan& plan, std::span<const EntryView> entries,
-                           const std::vector<TemporaryKeySlot>& temporary) const {
+                           std::span<const uint32_t> uniqueEntryIndices,
+                           uint64_t* keyBytes = nullptr) const {
     uint64_t total = KeyMetadataSize(plan);
+    if (keyBytes != nullptr) {
+      *keyBytes = 0;
+    }
     auto add = [&](uint64_t bytes) {
       if (total > std::numeric_limits<uint64_t>::max() - bytes) {
         total = std::numeric_limits<uint64_t>::max();
@@ -891,12 +908,15 @@ class Database::Impl {
       total += bytes;
       return true;
     };
-    for (const TemporaryKeySlot& slot : temporary) {
-      if (slot.keyHash == 0) {
-        continue;
+    const size_t entryCount = EncodingEntryCount(entries, uniqueEntryIndices);
+    for (size_t position = 0; position < entryCount; ++position) {
+      const size_t entryIndex = EncodingEntryIndex(position, uniqueEntryIndices);
+      const EntryView& entry = entries[entryIndex];
+      if (keyBytes != nullptr &&
+          !CheckedAdd(*keyBytes, static_cast<uint64_t>(entry.key.size()), *keyBytes)) {
+        *keyBytes = std::numeric_limits<uint64_t>::max();
       }
-      const EntryView& entry = entries[slot.entryIndex];
-      const std::string_view suffix = EntrySuffix(plan, slot.entryIndex, entry.key);
+      const std::string_view suffix = EntrySuffix(plan, entryIndex, entry.key);
       if (!add(Varint32Size(static_cast<uint32_t>(suffix.size()))) ||
           !add(Varint32Size(static_cast<uint32_t>(entry.value.size()))) ||
           !add(plan.prefixes.empty() ? 0 : 1) ||
@@ -909,15 +929,13 @@ class Database::Impl {
   }
 
   bool AddAlphabet(KeyEncodingPlan& plan, std::span<const EntryView> entries,
-                   const std::vector<TemporaryKeySlot>& temporary) const {
+                   std::span<const uint32_t> uniqueEntryIndices) const {
     std::array<bool, 256> present{};
     uint32_t symbolCount = 0;
-    for (const TemporaryKeySlot& slot : temporary) {
-      if (slot.keyHash == 0) {
-        continue;
-      }
-      const std::string_view suffix =
-          EntrySuffix(plan, slot.entryIndex, entries[slot.entryIndex].key);
+    const size_t entryCount = EncodingEntryCount(entries, uniqueEntryIndices);
+    for (size_t position = 0; position < entryCount; ++position) {
+      const size_t entryIndex = EncodingEntryIndex(position, uniqueEntryIndices);
+      const std::string_view suffix = EntrySuffix(plan, entryIndex, entries[entryIndex].key);
       for (const unsigned char byte : suffix) {
         if (!present[byte]) {
           present[byte] = true;
@@ -944,20 +962,12 @@ class Database::Impl {
   }
 
   KeyEncodingPlan ChooseKeyEncoding(std::span<const EntryView> entries,
-                                    const std::vector<TemporaryKeySlot>& temporary) const {
+                                    std::span<const uint32_t> uniqueEntryIndices) const {
     KeyEncodingPlan raw;
     raw.symbolCodes.fill(0xff);
-    raw.encodedBytes = MeasureEncoding(raw, entries, temporary);
-    uint64_t uniqueCount = 0;
     uint64_t keyBytes = 0;
-    for (const TemporaryKeySlot& slot : temporary) {
-      if (slot.keyHash != 0) {
-        ++uniqueCount;
-        if (!CheckedAdd(keyBytes, entries[slot.entryIndex].key.size(), keyBytes)) {
-          keyBytes = std::numeric_limits<uint64_t>::max();
-        }
-      }
-    }
+    raw.encodedBytes = MeasureEncoding(raw, entries, uniqueEntryIndices, &keyBytes);
+    const uint64_t uniqueCount = EncodingEntryCount(entries, uniqueEntryIndices);
     // Short keys are already compact. Keeping them raw avoids paying decode
     // CPU for only a few bytes of potential savings.
     if (uniqueCount == 0 || keyBytes < uniqueCount * 16) {
@@ -966,20 +976,18 @@ class Database::Impl {
     KeyEncodingPlan best = raw;
 
     KeyEncodingPlan packed = raw;
-    if (AddAlphabet(packed, entries, temporary)) {
-      packed.encodedBytes = MeasureEncoding(packed, entries, temporary);
+    if (AddAlphabet(packed, entries, uniqueEntryIndices)) {
+      packed.encodedBytes = MeasureEncoding(packed, entries, uniqueEntryIndices);
       if (packed.encodedBytes < best.encodedBytes) {
         best = packed;
       }
     }
 
     std::unordered_map<std::string_view, uint32_t> prefixCounts;
-    prefixCounts.reserve(std::min<size_t>(temporary.size() * 2, 128 * 1024));
-    for (const TemporaryKeySlot& slot : temporary) {
-      if (slot.keyHash == 0) {
-        continue;
-      }
-      const std::string_view key = entries[slot.entryIndex].key;
+    prefixCounts.reserve(static_cast<size_t>(std::min<uint64_t>(uniqueCount * 2, 128ULL * 1024)));
+    for (size_t position = 0; position < uniqueCount; ++position) {
+      const size_t entryIndex = EncodingEntryIndex(position, uniqueEntryIndices);
+      const std::string_view key = entries[entryIndex].key;
       for (const uint32_t length : kCandidatePrefixLengths) {
         if (key.size() > length) {
           ++prefixCounts[key.substr(0, length)];
@@ -1035,11 +1043,9 @@ class Database::Impl {
         }
       }
       std::vector<bool> used(prefixPlan.prefixes.size(), false);
-      for (const TemporaryKeySlot& slot : temporary) {
-        if (slot.keyHash == 0) {
-          continue;
-        }
-        const std::string_view key = entries[slot.entryIndex].key;
+      for (size_t position = 0; position < uniqueCount; ++position) {
+        const size_t entryIndex = EncodingEntryIndex(position, uniqueEntryIndices);
+        const std::string_view key = entries[entryIndex].key;
         for (size_t lengthIndex = 0; lengthIndex < kCandidatePrefixLengths.size(); ++lengthIndex) {
           const uint32_t length = kCandidatePrefixLengths[lengthIndex];
           if (key.size() <= length) {
@@ -1047,7 +1053,7 @@ class Database::Impl {
           }
           const auto found = selectedByLength[lengthIndex].find(key.substr(0, length));
           if (found != selectedByLength[lengthIndex].end()) {
-            prefixPlan.prefixIdsByEntry[slot.entryIndex] = found->second;
+            prefixPlan.prefixIdsByEntry[entryIndex] = found->second;
             used[found->second - 1] = true;
             break;
           }
@@ -1067,13 +1073,13 @@ class Database::Impl {
         id = remap[id];
       }
       prefixPlan.prefixes = std::move(usedPrefixes);
-      prefixPlan.encodedBytes = MeasureEncoding(prefixPlan, entries, temporary);
+      prefixPlan.encodedBytes = MeasureEncoding(prefixPlan, entries, uniqueEntryIndices);
       if (prefixPlan.encodedBytes < best.encodedBytes) {
         best = prefixPlan;
       }
       KeyEncodingPlan prefixPacked = prefixPlan;
-      if (AddAlphabet(prefixPacked, entries, temporary)) {
-        prefixPacked.encodedBytes = MeasureEncoding(prefixPacked, entries, temporary);
+      if (AddAlphabet(prefixPacked, entries, uniqueEntryIndices)) {
+        prefixPacked.encodedBytes = MeasureEncoding(prefixPacked, entries, uniqueEntryIndices);
         if (prefixPacked.encodedBytes < best.encodedBytes) {
           best = std::move(prefixPacked);
         }
@@ -1307,7 +1313,6 @@ class Database::Impl {
                           const KeyEncodingPlan& plan) const {
     const uint32_t outputSize =
         PackedByteCount(static_cast<uint32_t>(suffix.size()), plan.bitsPerSymbol);
-    std::memset(output, 0, outputSize);
     if (plan.bitsPerSymbol == 8) {
       std::memcpy(output, suffix.data(), suffix.size());
       return;
@@ -1491,6 +1496,11 @@ class Database::Impl {
       return status;
     }
     CacheRoutingConfiguration();
+    if (!readOnly_ && options_.oneShotBuild && IndexHeader()->itemCount != 0) {
+      CloseFiles();
+      return Status::InvalidArgument(
+          "oneShotBuild requires an empty database and cannot append to an existing build");
+    }
     status = OpenRowFiles();
     if (!status) {
       CloseFiles();
@@ -2194,9 +2204,12 @@ class Database::Impl {
 
   Status WriteStageGroup(const StageGroup& group) {
     std::vector<OwnedEntry> existing;
-    Status status = LoadExistingRow(group.column, group.columnHash, group.rowId, existing);
-    if (!status) {
-      return status;
+    Status status = Status::Ok();
+    if (!options_.oneShotBuild) {
+      status = LoadExistingRow(group.column, group.columnHash, group.rowId, existing);
+      if (!status) {
+        return status;
+      }
     }
     std::vector<EntryView> entries;
     entries.reserve(existing.size() + group.entries.size());
@@ -2321,13 +2334,10 @@ class Database::Impl {
   Status BuildRowBlock(std::string_view column, uint64_t columnHash, uint64_t rowId,
                        uint64_t sequence, std::span<const EntryView> entries,
                        std::vector<std::byte>& block, uint32_t& itemCount) const {
-    if (entries.empty()) {
+    if (entries.empty() || entries.size() > std::numeric_limits<uint32_t>::max()) {
       return Status::InvalidArgument("row has an unsupported number of entries");
     }
 
-    // Grow according to the number of unique keys, not the number of staged
-    // records. Duplicate writes only replace an entry index and therefore do
-    // not inflate either the temporary table or the persisted row table.
     auto dedupBucketCountForEntries = [](uint64_t entryCount) {
       const uint64_t requiredBuckets =
           static_cast<uint64_t>(static_cast<long double>(entryCount) / 0.75) + 1;
@@ -2338,97 +2348,155 @@ class Database::Impl {
           static_cast<uint64_t>(static_cast<long double>(entryCount) / kRowLoadFactor) + 1;
       return RoundUpPowerOfTwo(requiredBuckets, kControlGroupWidth);
     };
-    const uint64_t initialEntryEstimate = std::min<uint64_t>(
-        {entries.size(), kMaximumDedupPresizeEntries, RoutingTargetEntries(targetEntriesPerRow_)});
-    const uint64_t initialBucketCount = dedupBucketCountForEntries(initialEntryEstimate);
-    if (initialBucketCount == 0 || initialBucketCount > std::numeric_limits<uint32_t>::max()) {
-      return Status::InvalidArgument("row local index is too large");
-    }
-
-    std::vector<TemporaryKeySlot> temporary(static_cast<size_t>(initialBucketCount));
-    auto rehashTemporaryTable = [&](uint64_t newBucketCount) -> Status {
-      if (newBucketCount == 0 || newBucketCount > std::numeric_limits<uint32_t>::max() ||
-          newBucketCount > std::numeric_limits<size_t>::max()) {
-        return Status::InvalidArgument("row local index is too large");
-      }
-      if (newBucketCount == temporary.size()) {
-        return Status::Ok();
-      }
-      std::vector<TemporaryKeySlot> rehashed(static_cast<size_t>(newBucketCount));
-      const size_t mask = rehashed.size() - 1;
-      for (const TemporaryKeySlot& source : temporary) {
-        if (source.keyHash == 0) {
-          continue;
-        }
-        const size_t start = static_cast<size_t>(source.keyHash) & mask;
-        bool placed = false;
-        for (size_t probe = 0; probe < rehashed.size(); ++probe) {
-          TemporaryKeySlot& target = rehashed[(start + probe) & mask];
-          if (target.keyHash == 0) {
-            target = source;
-            placed = true;
-            break;
-          }
-        }
-        if (!placed) {
-          return Status::Corruption("row local index is unexpectedly full during rehash");
-        }
-      }
-      temporary = std::move(rehashed);
-      return Status::Ok();
-    };
 
     uint32_t uniqueCount = 0;
-    for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
-      const EntryView& entry = entries[entryIndex];
-      const uint64_t keyHash = NormalizeHash(entry.keyHash);
-      for (;;) {
-        const size_t mask = temporary.size() - 1;
-        const size_t start = static_cast<size_t>(keyHash) & mask;
-        size_t emptyIndex = temporary.size();
-        bool replaced = false;
-        for (size_t probe = 0; probe < temporary.size(); ++probe) {
-          const size_t slotIndex = (start + probe) & mask;
-          TemporaryKeySlot& slot = temporary[slotIndex];
-          if (slot.keyHash == 0) {
-            emptyIndex = slotIndex;
-            break;
-          }
-          if (slot.keyHash == keyHash && entries[slot.entryIndex].key == entry.key) {
-            slot.entryIndex = entryIndex;
-            replaced = true;
+    uint32_t bucketCount = 0;
+    std::vector<TemporaryKeySlot> temporary;
+    std::vector<uint32_t> uniqueEntryIndices;
+    std::vector<std::byte> oneShotControls;
+    std::vector<uint32_t> oneShotBucketEntries;
+
+    if (options_.oneShotBuild) {
+      const uint64_t bucketCount64 = finalBucketCountForEntries(entries.size());
+      if (bucketCount64 == 0 || bucketCount64 > std::numeric_limits<uint32_t>::max()) {
+        return Status::InvalidArgument("row local index is too large");
+      }
+      bucketCount = static_cast<uint32_t>(bucketCount64);
+      const uint32_t groupCount = bucketCount / kControlGroupWidth;
+      oneShotControls.assign(bucketCount, std::byte{0});
+      oneShotBucketEntries.assign(bucketCount, std::numeric_limits<uint32_t>::max());
+
+      // The scratch table has the exact persisted probing layout. Its 1-byte
+      // controls plus 4-byte entry indices replace the normal 16-byte
+      // TemporaryKeySlot table, and the selected bucket is reused directly
+      // when entry indices become record offsets below. The one-shot contract
+      // guarantees unique keys, so this path deliberately does not probe old
+      // keys for duplicates.
+      for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+        const EntryView& entry = entries[entryIndex];
+        const uint64_t keyHash = NormalizeHash(entry.keyHash);
+        const uint32_t startGroup = static_cast<uint32_t>(keyHash) & (groupCount - 1);
+        uint32_t bucketIndex = bucketCount;
+        for (uint32_t groupProbe = 0; groupProbe < groupCount; ++groupProbe) {
+          const uint32_t groupIndex = (startGroup + groupProbe) & (groupCount - 1);
+          const uint32_t groupBase = groupIndex * kControlGroupWidth;
+          const std::byte* controls = oneShotControls.data() + groupBase;
+          const uint16_t emptyLanes = ControlMatchMask(controls, 0);
+          if (emptyLanes != 0) {
+            bucketIndex = groupBase + std::countr_zero(emptyLanes);
             break;
           }
         }
-        if (replaced) {
+        if (bucketIndex == bucketCount) {
+          return Status::Corruption("one-shot row control table is unexpectedly full");
+        }
+        oneShotControls[bucketIndex] = static_cast<std::byte>(KeyFingerprint(keyHash));
+        oneShotBucketEntries[bucketIndex] = static_cast<uint32_t>(entryIndex);
+      }
+      uniqueCount = static_cast<uint32_t>(entries.size());
+    } else {
+      // The update-capable path grows according to unique keys. Duplicate
+      // writes replace an entry index and retain last-write-wins semantics.
+      const uint64_t initialEntryEstimate =
+          std::min<uint64_t>({entries.size(), kMaximumDedupPresizeEntries,
+                              RoutingTargetEntries(targetEntriesPerRow_)});
+      const uint64_t initialBucketCount = dedupBucketCountForEntries(initialEntryEstimate);
+      if (initialBucketCount == 0 || initialBucketCount > std::numeric_limits<uint32_t>::max()) {
+        return Status::InvalidArgument("row local index is too large");
+      }
+      temporary.resize(static_cast<size_t>(initialBucketCount));
+      auto rehashTemporaryTable = [&](uint64_t newBucketCount) -> Status {
+        if (newBucketCount == 0 || newBucketCount > std::numeric_limits<uint32_t>::max() ||
+            newBucketCount > std::numeric_limits<size_t>::max()) {
+          return Status::InvalidArgument("row local index is too large");
+        }
+        if (newBucketCount == temporary.size()) {
+          return Status::Ok();
+        }
+        std::vector<TemporaryKeySlot> rehashed(static_cast<size_t>(newBucketCount));
+        const size_t mask = rehashed.size() - 1;
+        for (const TemporaryKeySlot& source : temporary) {
+          if (source.keyHash == 0) {
+            continue;
+          }
+          const size_t start = static_cast<size_t>(source.keyHash) & mask;
+          bool placed = false;
+          for (size_t probe = 0; probe < rehashed.size(); ++probe) {
+            TemporaryKeySlot& target = rehashed[(start + probe) & mask];
+            if (target.keyHash == 0) {
+              target = source;
+              placed = true;
+              break;
+            }
+          }
+          if (!placed) {
+            return Status::Corruption("row local index is unexpectedly full during rehash");
+          }
+        }
+        temporary = std::move(rehashed);
+        return Status::Ok();
+      };
+
+      for (size_t entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+        const EntryView& entry = entries[entryIndex];
+        const uint64_t keyHash = NormalizeHash(entry.keyHash);
+        for (;;) {
+          const size_t mask = temporary.size() - 1;
+          const size_t start = static_cast<size_t>(keyHash) & mask;
+          size_t emptyIndex = temporary.size();
+          bool replaced = false;
+          for (size_t probe = 0; probe < temporary.size(); ++probe) {
+            const size_t slotIndex = (start + probe) & mask;
+            TemporaryKeySlot& slot = temporary[slotIndex];
+            if (slot.keyHash == 0) {
+              emptyIndex = slotIndex;
+              break;
+            }
+            if (slot.keyHash == keyHash && entries[slot.entryIndex].key == entry.key) {
+              slot.entryIndex = entryIndex;
+              replaced = true;
+              break;
+            }
+          }
+          if (replaced) {
+            break;
+          }
+          if (emptyIndex == temporary.size()) {
+            return Status::Corruption("row local index is unexpectedly full");
+          }
+
+          const uint64_t nextUniqueCount = static_cast<uint64_t>(uniqueCount) + 1;
+          if (nextUniqueCount * 4 >= static_cast<uint64_t>(temporary.size()) * 3) {
+            Status status = rehashTemporaryTable(static_cast<uint64_t>(temporary.size()) * 2);
+            if (!status) {
+              return status;
+            }
+            continue;
+          }
+          temporary[emptyIndex].keyHash = keyHash;
+          temporary[emptyIndex].entryIndex = entryIndex;
+          ++uniqueCount;
           break;
         }
-        if (emptyIndex == temporary.size()) {
-          return Status::Corruption("row local index is unexpectedly full");
-        }
+      }
 
-        const uint64_t nextUniqueCount = static_cast<uint64_t>(uniqueCount) + 1;
-        if (nextUniqueCount * 4 >= static_cast<uint64_t>(temporary.size()) * 3) {
-          Status status = rehashTemporaryTable(static_cast<uint64_t>(temporary.size()) * 2);
-          if (!status) {
-            return status;
-          }
-          continue;
+      const uint64_t bucketCount64 = finalBucketCountForEntries(uniqueCount);
+      if (bucketCount64 == 0 || bucketCount64 > std::numeric_limits<uint32_t>::max()) {
+        return Status::InvalidArgument("row local index is too large");
+      }
+      bucketCount = static_cast<uint32_t>(bucketCount64);
+      uniqueEntryIndices.reserve(uniqueCount);
+      for (const TemporaryKeySlot& slot : temporary) {
+        if (slot.keyHash != 0) {
+          uniqueEntryIndices.push_back(static_cast<uint32_t>(slot.entryIndex));
         }
-        temporary[emptyIndex].keyHash = keyHash;
-        temporary[emptyIndex].entryIndex = entryIndex;
-        ++uniqueCount;
-        break;
+      }
+      if (uniqueEntryIndices.size() != uniqueCount) {
+        return Status::Corruption("row unique-key table has an inconsistent item count");
       }
     }
 
-    const uint64_t bucketCount64 = finalBucketCountForEntries(uniqueCount);
-    if (bucketCount64 == 0 || bucketCount64 > std::numeric_limits<uint32_t>::max()) {
-      return Status::InvalidArgument("row local index is too large");
-    }
-    const uint32_t bucketCount = static_cast<uint32_t>(bucketCount64);
-
-    const KeyEncodingPlan encoding = ChooseKeyEncoding(entries, temporary);
+    const KeyEncodingPlan encoding = ChooseKeyEncoding(entries, uniqueEntryIndices);
     std::vector<std::byte> keyMetadata;
     Status status = SerializeKeyMetadata(encoding, keyMetadata);
     if (!status) {
@@ -2461,7 +2529,6 @@ class Database::Impl {
       return Status::InvalidArgument("row block exceeds the 4 GiB format limit");
     }
 
-    block.assign(static_cast<size_t>(blockSize), std::byte{0});
     detail::RowBlockHeader header;
     header.sequence = sequence;
     header.columnHash = columnHash;
@@ -2473,38 +2540,20 @@ class Database::Impl {
     header.recordBytesSize = static_cast<uint32_t>(recordBytesSize);
     header.blockSize = static_cast<uint32_t>(blockSize);
     header.recordOffsetWidth = recordOffsetWidth;
+
+    block.assign(static_cast<size_t>(blockSize), std::byte{0});
     std::memcpy(block.data(), &header, sizeof(header));
     std::memcpy(block.data() + sizeof(header), column.data(), column.size());
     std::memcpy(block.data() + metadataOffset, keyMetadata.data(), keyMetadata.size());
 
-    uint32_t recordCursor = 0;
     const uint32_t groupCount = bucketCount / kControlGroupWidth;
     const bool interleaved = recordOffsetWidth == 3;
-    for (const TemporaryKeySlot& temporarySlot : temporary) {
-      if (temporarySlot.keyHash == 0) {
-        continue;
+    uint32_t recordCursor = 0;
+    auto appendEntry = [&](uint32_t bucketIndex, size_t entryIndex, uint64_t keyHash) -> Status {
+      if (entryIndex >= entries.size()) {
+        return Status::Corruption("row builder has an invalid entry index");
       }
-      const EntryView& entry = entries[temporarySlot.entryIndex];
-      const uint8_t fingerprint = KeyFingerprint(temporarySlot.keyHash);
-      const uint32_t startGroup = static_cast<uint32_t>(temporarySlot.keyHash) & (groupCount - 1);
-      uint32_t bucketIndex = bucketCount;
-      for (uint32_t groupProbe = 0; groupProbe < groupCount; ++groupProbe) {
-        const uint32_t groupIndex = (startGroup + groupProbe) & (groupCount - 1);
-        const uint32_t groupBase = groupIndex * kControlGroupWidth;
-        std::byte* groupData = block.data() + localIndexOffset +
-                               static_cast<uint64_t>(groupBase) * (interleaved ? 4 : 1);
-        const uint16_t emptyLanes = interleaved ? InterleavedControlMatchMask(groupData, 0)
-                                                : ControlMatchMask(groupData, 0);
-        if (emptyLanes != 0) {
-          bucketIndex = groupBase + std::countr_zero(emptyLanes);
-        }
-        if (bucketIndex != bucketCount) {
-          break;
-        }
-      }
-      if (bucketIndex == bucketCount) {
-        return Status::Corruption("row control table is unexpectedly full");
-      }
+      const uint8_t fingerprint = KeyFingerprint(keyHash);
       if (interleaved) {
         std::byte* bucket =
             block.data() + localIndexOffset + static_cast<uint64_t>(bucketIndex) * 4;
@@ -2517,8 +2566,9 @@ class Database::Impl {
             recordCursor, recordOffsetWidth);
       }
 
+      const EntryView& entry = entries[entryIndex];
+      const std::string_view suffix = EntrySuffix(encoding, entryIndex, entry.key);
       std::byte* record = block.data() + recordsOffset + recordCursor;
-      const std::string_view suffix = EntrySuffix(encoding, temporarySlot.entryIndex, entry.key);
       recordCursor +=
           static_cast<uint32_t>(WriteVarint32(record, static_cast<uint32_t>(suffix.size())));
       record = block.data() + recordsOffset + recordCursor;
@@ -2526,7 +2576,7 @@ class Database::Impl {
           static_cast<uint32_t>(WriteVarint32(record, static_cast<uint32_t>(entry.value.size())));
       if (!encoding.prefixes.empty()) {
         block[recordsOffset + recordCursor++] =
-            static_cast<std::byte>(encoding.prefixIdsByEntry[temporarySlot.entryIndex]);
+            static_cast<std::byte>(encoding.prefixIdsByEntry[entryIndex]);
       }
       const uint32_t encodedSuffixSize =
           PackedByteCount(static_cast<uint32_t>(suffix.size()), encoding.bitsPerSymbol);
@@ -2537,7 +2587,52 @@ class Database::Impl {
                     entry.value.size());
       }
       recordCursor += static_cast<uint32_t>(entry.value.size());
+      return Status::Ok();
+    };
+
+    if (options_.oneShotBuild) {
+      for (uint32_t bucketIndex = 0; bucketIndex < bucketCount; ++bucketIndex) {
+        if (oneShotControls[bucketIndex] == std::byte{0}) {
+          continue;
+        }
+        const uint32_t entryIndex = oneShotBucketEntries[bucketIndex];
+        if (entryIndex >= entries.size()) {
+          return Status::Corruption("one-shot bucket points outside the staged entries");
+        }
+        status = appendEntry(bucketIndex, entryIndex, NormalizeHash(entries[entryIndex].keyHash));
+        if (!status) {
+          return status;
+        }
+      }
+    } else {
+      for (const TemporaryKeySlot& temporarySlot : temporary) {
+        if (temporarySlot.keyHash == 0) {
+          continue;
+        }
+        const uint32_t startGroup = static_cast<uint32_t>(temporarySlot.keyHash) & (groupCount - 1);
+        uint32_t bucketIndex = bucketCount;
+        for (uint32_t groupProbe = 0; groupProbe < groupCount; ++groupProbe) {
+          const uint32_t groupIndex = (startGroup + groupProbe) & (groupCount - 1);
+          const uint32_t groupBase = groupIndex * kControlGroupWidth;
+          std::byte* groupData = block.data() + localIndexOffset +
+                                 static_cast<uint64_t>(groupBase) * (interleaved ? 4 : 1);
+          const uint16_t emptyLanes = interleaved ? InterleavedControlMatchMask(groupData, 0)
+                                                  : ControlMatchMask(groupData, 0);
+          if (emptyLanes != 0) {
+            bucketIndex = groupBase + std::countr_zero(emptyLanes);
+            break;
+          }
+        }
+        if (bucketIndex == bucketCount) {
+          return Status::Corruption("row control table is unexpectedly full");
+        }
+        status = appendEntry(bucketIndex, temporarySlot.entryIndex, temporarySlot.keyHash);
+        if (!status) {
+          return status;
+        }
+      }
     }
+
     if (recordCursor != recordBytesSize) {
       return Status::Corruption("packed row record size mismatch");
     }

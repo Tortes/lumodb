@@ -620,6 +620,41 @@ TEST(DatabaseTest, RecordOffsetsAdaptBetween24And32Bits) {
   EXPECT_EQ(largeHeader.recordOffsetWidth, 4);
 }
 
+TEST(DatabaseTest, OneShotBuildHandles32BitRecordOffsets) {
+  const auto directory = LumoDB::test::MakeTestDirectory("one-shot-large-record-offsets");
+  LumoDB::DatabaseOptions options = TestOptions(2);
+  options.oneShotBuild = true;
+  options.writerThreadCount = 1;
+  options.rowShardCount = 1;
+  options.spillPartitionCount = 1;
+
+  const std::vector<std::byte> largeValue(16 * 1024 * 1024, std::byte{0x4d});
+  const std::vector<std::byte> smallValue = LumoDB::test::MakeBytes("tail-value");
+  const std::array<LumoDB::StructEntry, 2> entries = {
+      LumoDB::StructEntry{.key = "large-key", .flatBufferBytes = largeValue},
+      LumoDB::StructEntry{.key = "tail-key", .flatBufferBytes = smallValue},
+  };
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+  ASSERT_OK(database.PutStructs("offsets", entries));
+  ASSERT_OK(database.Flush());
+
+  std::vector<std::byte> actual;
+  ASSERT_OK(database.Get("offsets", "large-key", actual));
+  EXPECT_EQ(actual, largeValue);
+  ASSERT_OK(database.Get("offsets", "tail-key", actual));
+  EXPECT_EQ(actual, smallValue);
+  ASSERT_OK(database.Close());
+
+  LumoDB::detail::FileDescriptor file;
+  ASSERT_OK(LumoDB::detail::OpenReadOnly(directory / "row_values-000.lumorv", file));
+  LumoDB::detail::RowBlockHeader header;
+  ASSERT_OK(LumoDB::detail::ReadAllAt(file.Get(), &header, sizeof(header),
+                                      sizeof(LumoDB::detail::RowValueFileHeader)));
+  EXPECT_EQ(header.recordOffsetWidth, 4);
+}
+
 TEST(DatabaseTest, StagingStaysInMemoryAndSpillsOnlyAfterItsBudget) {
   auto hasStageFile = [](const std::filesystem::path& directory) {
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
@@ -658,6 +693,53 @@ TEST(DatabaseTest, StagingStaysInMemoryAndSpillsOnlyAfterItsBudget) {
   std::vector<std::byte> actual;
   ASSERT_OK(spillDatabase.GetRowStruct("column", 1, "key", actual));
   EXPECT_EQ(actual, largeValue);
+}
+
+TEST(DatabaseTest, OneShotBuildPersistsAutomaticBatchAndRejectsFurtherWrites) {
+  constexpr uint32_t kEntryCount = 4'000;
+  const auto directory = LumoDB::test::MakeTestDirectory("one-shot-automatic");
+  LumoDB::DatabaseOptions options = TestOptions(kEntryCount);
+  options.oneShotBuild = true;
+  options.rowShardCount = 2;
+  options.spillPartitionCount = 4;
+
+  std::vector<std::string> keys;
+  std::vector<std::vector<std::byte>> values;
+  std::vector<LumoDB::StructEntry> entries;
+  keys.reserve(kEntryCount);
+  values.reserve(kEntryCount);
+  entries.reserve(kEntryCount);
+  for (uint32_t index = 0; index < kEntryCount; ++index) {
+    keys.push_back(std::string(32, 'p') + "compiler-key-" + std::to_string(index));
+    values.push_back(LumoDB::test::MakeBytes("value-" + std::to_string(index)));
+    entries.push_back({.key = keys.back(), .flatBufferBytes = values.back()});
+  }
+
+  LumoDB::Database database;
+  ASSERT_OK(database.Open(directory, options));
+  ASSERT_OK(database.PutStructs("objects", entries));
+  ASSERT_OK(database.Flush());
+  EXPECT_EQ(database.EntryCount(), kEntryCount);
+  EXPECT_GT(database.RowCount(), 1);
+
+  std::vector<std::byte> actual;
+  for (uint32_t index = 0; index < kEntryCount; ++index) {
+    ASSERT_OK(database.Get("objects", keys[index], actual));
+    EXPECT_EQ(actual, values[index]);
+  }
+  EXPECT_EQ(database.Put("objects", "late-key", "late-value").Code(),
+            LumoDB::StatusCode::kInvalidArgument);
+  ASSERT_OK(database.Close());
+
+  LumoDB::Database append;
+  EXPECT_EQ(append.Open(directory, options).Code(), LumoDB::StatusCode::kInvalidArgument);
+
+  LumoDB::Database reader;
+  ASSERT_OK(reader.OpenReadOnly(directory));
+  for (const uint32_t index : {0U, 2047U, kEntryCount - 1}) {
+    ASSERT_OK(reader.Get("objects", keys[index], actual));
+    EXPECT_EQ(actual, values[index]);
+  }
 }
 
 TEST(DatabaseTest, AutomaticAndExplicitRowsCanCoexist) {
